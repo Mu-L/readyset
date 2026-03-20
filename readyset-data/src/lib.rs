@@ -142,7 +142,8 @@ pub enum DfValue {
     // - make sure to always keep Max last - we use the order of the variants to compare
     // - remember to add that variant to:
     //   - The `proptest::Arbitrary` impl for `DfValue`,
-    //   - The `example_row` in `src/serde.rs`
+    //   - `example_serialized_keys()` in `dataflow-state/src/persistent_state/format_version.rs`
+    //   - Bump `PERSISTENT_STATE_VERSION` in `dataflow-state/src/persistent_state/format_version.rs`
 }
 
 impl SizeOf for DfValue {

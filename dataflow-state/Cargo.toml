@@ -10,6 +10,7 @@ ahash = { workspace = true }
 antithesis_sdk = { workspace = true }
 anyhow = { workspace = true }
 bincode = { workspace = true }
+bit-vec = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 derive_more = { workspace = true }
 hashbag = { workspace = true }
@@ -37,9 +38,11 @@ vec1 = { workspace = true }
 # local deps
 common = { path = "../readyset-common", package = "readyset-common" }
 partial-map = { path = "../partial-map" }
+mysql-time = { path = "../mysql-time" }
 readyset-alloc = { path = "../readyset-alloc" }
 readyset-client = { path = "../readyset-client" }
 readyset-data = { path = "../readyset-data" }
+readyset-decimal = { path = "../readyset-decimal" }
 readyset-errors = { path = "../readyset-errors" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-util = { path = "../readyset-util" }
@@ -54,7 +57,6 @@ lazy_static = { workspace = true }
 pretty_assertions = { workspace = true }
 test-utils = { path = "../test-utils" }
 proptest-stateful = { path = "../proptest-stateful" }
-readyset-decimal = { path = "../readyset-decimal" }
 
 [features]
 failure_injection = [

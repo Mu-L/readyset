@@ -109,6 +109,11 @@ use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, info_span, trace, warn};
 
+mod format_version;
+
+use format_version::PERSISTENT_STATE_VERSION;
+pub use format_version::{example_serialized_keys, example_serialized_row};
+
 use crate::persistent_state::metrics::{MetricsReporter, MetricsReporterStop};
 use crate::{
     EvictKeysResult, EvictRandomResult, LookupResult, PersistencePoint, PointKey, RangeKey,
@@ -364,11 +369,11 @@ pub enum Error {
     BadDbFormat,
 
     #[error(
-        "Persisted state at {} has serialization version {persisted_version}, which does not match \
-         our serialization version {our_version}",
+        "Persisted state at {} has format version {persisted_version}, which does not match \
+         our format version {our_version}",
         path.display(),
     )]
-    SerdeVersionMismatch {
+    PersistentStateVersionMismatch {
         path: PathBuf,
         persisted_version: u8,
         our_version: u8,
@@ -399,7 +404,7 @@ impl Error {
             // Could *maybe* try to slice up the IO errors here, but for now it's simpler to just
             // assume all IO errors are permanent
             Error::Io(_) => true,
-            Error::BadDbFormat | Error::SerdeVersionMismatch { .. } => false,
+            Error::BadDbFormat | Error::PersistentStateVersionMismatch { .. } => false,
         }
     }
 }
@@ -427,10 +432,10 @@ struct PendingBuildMeta {
 /// Data structure used to persist metadata about the [`PersistentState`] to rocksdb
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct PersistentMeta<'a> {
-    /// The version of serialization used to serialize data to this [`PersistentState`]. This is
-    /// compared against [`DfValue::SERDE_VERSION`] at startup, and if it's unequal an error will
-    /// be returned
-    serde_version: u8,
+    /// The on-disk format version, compared against [`PERSISTENT_STATE_VERSION`] at startup. If
+    /// unequal, the database is deleted and re-snapshotted.
+    #[serde(alias = "serde_version")]
+    persistent_state_version: u8,
 
     /// Index information is stored in RocksDB to avoid rebuilding indices on recovery
     indices: Vec<Index>,
@@ -685,7 +690,7 @@ impl<'a> PersistentMeta<'a> {
         replication_offset: Option<Cow<'a, ReplicationOffset>>,
     ) -> Self {
         PersistentMeta {
-            serde_version: DfValue::SERDE_VERSION,
+            persistent_state_version: PERSISTENT_STATE_VERSION,
             indices: shared_state
                 .indices
                 .iter()
@@ -1860,11 +1865,11 @@ impl PersistentState {
             .and_then(|db| get_meta(&db).ok());
 
         if let Some(meta) = &meta {
-            if meta.serde_version != DfValue::SERDE_VERSION {
-                return Err(Error::SerdeVersionMismatch {
+            if meta.persistent_state_version != PERSISTENT_STATE_VERSION {
+                return Err(Error::PersistentStateVersionMismatch {
                     path,
-                    persisted_version: meta.serde_version,
-                    our_version: DfValue::SERDE_VERSION,
+                    persisted_version: meta.persistent_state_version,
+                    our_version: PERSISTENT_STATE_VERSION,
                 });
             }
         }
