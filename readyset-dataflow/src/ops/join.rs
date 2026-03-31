@@ -257,8 +257,8 @@ impl Join {
     fn hash_join(&self, left: Records, right: Records) -> ReadySetResult<Records> {
         let mut probe_keys = vec![];
         let mut build_keys = vec![];
-        let mut ret: Vec<Record> = vec![];
         let probe_is_left = left.len() > right.len();
+        let mut ret: Vec<Record> = Vec::with_capacity(left.len().max(right.len()));
         for (left_key, right_key) in &self.on {
             match probe_is_left {
                 true => {
@@ -368,18 +368,13 @@ impl Join {
         Ok(ret.into())
     }
 
-    // TODO: make non-allocating
     fn generate_null(&self, left: &[DfValue]) -> Vec<DfValue> {
-        self.emit
-            .iter()
-            .map(|&(side, col)| {
-                if side == Side::Left {
-                    left[col].clone()
-                } else {
-                    DfValue::None
-                }
-            })
-            .collect()
+        let len = self.emit.len();
+        let mut result = vec![DfValue::None; len];
+        for &EmitColumn { output, source } in &self.emit_left {
+            result[output] = left[source].clone();
+        }
+        result
     }
 
     /// Returns `true` if the left row passes the `left_filter`, or if no filter is set.
