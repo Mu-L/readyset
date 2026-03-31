@@ -574,6 +574,10 @@ impl DomainBuilder {
         unquery: bool,
         table_status_tx: UnboundedSender<(Relation, TableStatus)>,
     ) -> (Domain, ReplayReceiver) {
+        for n in self.nodes.values() {
+            n.borrow_mut().post_deserialize();
+        }
+
         // initially, all nodes are not ready
         let not_ready = self
             .nodes

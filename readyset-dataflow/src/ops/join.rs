@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
+use std::mem;
 
 use dataflow_state::PointKey;
 use itertools::Itertools;
@@ -37,6 +38,15 @@ pub enum JoinExecutionMode {
     StraddledHashJoin,
     /// Straddled with one upquery and state lookups on other side. This is done when the right side is fully materialized and we are guaranteed to not miss on lookup.
     StraddledRegularLookup,
+}
+
+/// A mapping from an output column position to a source column index.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EmitColumn {
+    /// Index in the output row.
+    output: usize,
+    /// Column index in the source (left or right) row.
+    source: usize,
 }
 
 /// Join rows between two nodes based on a (compound) equal join key
@@ -79,6 +89,15 @@ pub struct Join {
     /// in `emit`). Precomputed at construction time; recomputed in `post_deserialize`.
     #[serde(skip)]
     emit_move_safe: bool,
+
+    /// Pre-split emit indices for left-side columns.
+    /// Avoids per-column `Side` branching in the hot path.
+    #[serde(skip)]
+    emit_left: Vec<EmitColumn>,
+
+    /// Pre-split emit indices for right-side columns.
+    #[serde(skip)]
+    emit_right: Vec<EmitColumn>,
 }
 
 impl Join {
@@ -112,6 +131,8 @@ impl Join {
             missing_upqueries: Default::default(),
             left_filter,
             emit_move_safe: false,
+            emit_left: Vec::new(),
+            emit_right: Vec::new(),
         };
         join.recompute_emit_metadata();
         join
@@ -128,6 +149,26 @@ impl Join {
     /// Recompute all `#[serde(skip)]` emit-related metadata from `self.emit`.
     /// Called from `new()` and `post_deserialize()`.
     fn recompute_emit_metadata(&mut self) {
+        self.emit_left = self
+            .emit
+            .iter()
+            .enumerate()
+            .filter(|(_, &(side, _))| side == Side::Left)
+            .map(|(i, &(_, col))| EmitColumn {
+                output: i,
+                source: col,
+            })
+            .collect();
+        self.emit_right = self
+            .emit
+            .iter()
+            .enumerate()
+            .filter(|(_, &(side, _))| side == Side::Right)
+            .map(|(i, &(_, col))| EmitColumn {
+                output: i,
+                source: col,
+            })
+            .collect();
         self.emit_move_safe = {
             let mut left_cols = HashSet::new();
             let mut right_cols = HashSet::new();
@@ -147,13 +188,24 @@ impl Join {
     }
 
     fn generate_row(&self, left: &[DfValue], right: &[DfValue]) -> Vec<DfValue> {
-        self.emit
-            .iter()
-            .map(|&(side, col)| match side {
-                Side::Left => left[col].clone(),
-                Side::Right => right[col].clone(),
-            })
-            .collect()
+        let len = self.emit.len();
+        let mut result = Vec::with_capacity(len);
+        let vals = result.spare_capacity_mut();
+        let mut c = 0;
+        for &EmitColumn { output, source } in &self.emit_left {
+            vals[output].write(left[source].clone());
+            c += 1;
+        }
+        for &EmitColumn { output, source } in &self.emit_right {
+            vals[output].write(right[source].clone());
+            c += 1;
+        }
+        assert_eq!(c, len);
+        // SAFETY: all `len` slots written via emit_left ∪ emit_right; assert above confirms.
+        unsafe {
+            result.set_len(len);
+        }
+        result
     }
 
     /// Like [`generate_row`], but moves values from the owned side instead of cloning.
@@ -164,15 +216,23 @@ impl Join {
         borrowed: &[DfValue],
         owned_is_left: bool,
     ) -> Vec<DfValue> {
-        let mut result = Vec::with_capacity(self.emit.len());
-        for &(side, col) in &self.emit {
-            let from_owned =
-                (owned_is_left && side == Side::Left) || (!owned_is_left && side == Side::Right);
-            if from_owned {
-                result.push(std::mem::take(&mut owned[col]));
-            } else {
-                result.push(borrowed[col].clone());
-            }
+        let len = self.emit.len();
+        let mut result = Vec::with_capacity(len);
+        let vals = result.spare_capacity_mut();
+        let (move_cols, clone_cols) = if owned_is_left {
+            (&self.emit_left, &self.emit_right)
+        } else {
+            (&self.emit_right, &self.emit_left)
+        };
+        for &EmitColumn { output, source } in move_cols {
+            vals[output].write(mem::take(&mut owned[source]));
+        }
+        for &EmitColumn { output, source } in clone_cols {
+            vals[output].write(borrowed[source].clone());
+        }
+        // SAFETY: all `len` slots written via move_cols ∪ clone_cols.
+        unsafe {
+            result.set_len(len);
         }
         result
     }
