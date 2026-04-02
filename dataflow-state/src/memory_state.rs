@@ -511,18 +511,18 @@ impl MemoryState {
                     return true;
                 }
             };
-            self.mem_size += r.deep_size_of();
             (self.state[i].insert_row(r.clone()), Some(i))
         } else {
             let mut hit_any = false;
             for i in 0..self.state.len() {
                 hit_any |= self.state[i].insert_row(r.clone());
             }
-            if hit_any {
-                self.mem_size += r.deep_size_of();
-            }
             (hit_any, None)
         };
+
+        if hit {
+            self.mem_size += r.deep_size_of();
+        }
 
         if hit && !self.weak_indices.is_empty() {
             // For partial (tagged) inserts, skip the weak index insertion if the row already
