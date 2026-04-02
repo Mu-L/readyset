@@ -3541,6 +3541,22 @@ impl Domain {
                 cache_name: cache_name.clone(),
             };
 
+            // Keep a copy of the partial keys so we can detect which ones
+            // n.process() prunes (e.g. due to misses) and undo mark_filled
+            // for them. Cloned once here and maintained across the segment
+            // loop; re-cloned only when misses or captures modify it.
+            let mut backfill_keys: Option<HashSet<KeyComparison>> = if let ReplayPiece {
+                context: ReplayPieceContext::Partial { ref for_keys, .. },
+                ..
+            } = m
+            {
+                Some(for_keys.clone())
+            } else {
+                None
+            };
+
+            let mut backfill_keys_modified = false;
+
             for (i, segment) in path.iter().enumerate() {
                 if let Some(force_tag) = segment.force_tag_to {
                     trace!(
@@ -3555,25 +3571,7 @@ impl Domain {
                 // we know replay paths only contain real nodes
                 let mut n = self.nodes[segment.node].borrow_mut();
 
-                // keep track of whether we're filling any partial holes
                 let partial_key_cols = segment.partial_index.as_ref();
-                // keep a copy of the partial keys from before we process
-                // we need this because n.process may choose to reduce the set of keys
-                // (e.g., because some of them missed), in which case we need to know what
-                // keys to _undo_.
-                let mut backfill_keys = if let ReplayPiece {
-                    context:
-                        ReplayPieceContext::Partial {
-                            ref mut for_keys, ..
-                        },
-                    ..
-                } = m
-                {
-                    debug_assert!(partial_key_cols.is_some());
-                    Some(for_keys.clone())
-                } else {
-                    None
-                };
 
                 // Is this segment the target of the replay path?
                 let is_target = backfill_keys.is_some() && segment.is_target;
@@ -3644,8 +3642,8 @@ impl Domain {
                                         .as_slice(),
                                 );
                                 if let Some(inner) = waiting.redos.get(&(target_node, cols)) {
-                                    for key in backfill_keys.clone() {
-                                        if let Some(redos) = inner.get(&key) {
+                                    for key in backfill_keys.iter() {
+                                        if let Some(redos) = inner.get(key) {
                                             for redo in redos {
                                                 // Are we about to satisfy the last hole
                                                 // this redo was waiting for?
@@ -3795,6 +3793,7 @@ impl Domain {
                     {
                         if let Some(backfill_keys) = &mut backfill_keys {
                             backfill_keys.retain(|k| for_keys.contains(k));
+                            backfill_keys_modified = true;
                         }
                     }
                 }
@@ -3828,6 +3827,7 @@ impl Domain {
 
                     // we should only finish the replays for keys that *didn't* miss
                     backfill_keys.retain(|k| !missed_on.contains(k));
+                    backfill_keys_modified = true;
 
                     // prune all replayed records for keys where any replayed record for
                     // that key missed.
@@ -4039,16 +4039,27 @@ impl Domain {
                     m.link_mut().dst = path[i + 1].node;
                 }
 
-                // feed forward the updated backfill_keys
-                if let ReplayPiece {
-                    context:
-                        ReplayPieceContext::Partial {
-                            ref mut for_keys, ..
-                        },
-                    ..
-                } = m
-                {
-                    *for_keys = backfill_keys.unwrap();
+                // Sync for_keys in the packet with backfill_keys only when
+                // misses or captures actually changed the key set.
+                if backfill_keys_modified {
+                    if let ReplayPiece {
+                        context:
+                            ReplayPieceContext::Partial {
+                                ref mut for_keys, ..
+                            },
+                        ..
+                    } = m
+                    {
+                        *for_keys = if i + 1 < path.len() {
+                            backfill_keys
+                                .as_ref()
+                                .expect("partial implies Some")
+                                .clone()
+                        } else {
+                            backfill_keys.take().expect("partial implies Some")
+                        };
+                    }
+                    backfill_keys_modified = false;
                 }
             }
 
