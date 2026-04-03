@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
+use std::sync::Arc;
 use std::{iter, mem};
 
 use crate::node::Column;
@@ -391,7 +392,7 @@ pub struct ColumnMiss {
     /// The column indices that the lookup was performed in
     ///
     /// Invariant: this will have the same length as all the keys in `missed_keys`
-    pub column_indices: Vec<usize>,
+    pub column_indices: Arc<[usize]>,
     /// The keys that we missed on.
     ///
     /// Invariant: These keys will have the same length as `column_indices`

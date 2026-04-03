@@ -1255,7 +1255,7 @@ impl Ingredient for Join {
         let mut left_cols = vec![];
         let mut right_cols = vec![];
         let mut col_sides = vec![];
-        for col in miss.column_indices {
+        for &col in miss.column_indices.iter() {
             let (left_idx, right_idx) = self.resolve_col(col);
             if let Some(li) = left_idx {
                 left_cols.push(li);
@@ -1347,12 +1347,12 @@ impl Ingredient for Join {
         Ok(vec![
             ColumnMiss {
                 node: *self.left,
-                column_indices: left_cols,
+                column_indices: left_cols.into(),
                 missed_keys: Vec1::try_from(left_keys).unwrap(),
             },
             ColumnMiss {
                 node: *self.right,
-                column_indices: right_cols,
+                column_indices: right_cols.into(),
                 missed_keys: Vec1::try_from(right_keys).unwrap(),
             },
         ])
@@ -1620,6 +1620,8 @@ mod tests {
     }
 
     mod handle_upquery {
+        use std::sync::Arc;
+
         use readyset_data::{Bound, IntoBoundedRange};
 
         use super::*;
@@ -1632,7 +1634,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![
                         vec1![DfValue::from(1), DfValue::from(2), DfValue::from(3)].into()
                     ],
@@ -1642,8 +1644,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1663,7 +1665,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![
                         vec1![DfValue::from(1), DfValue::from(2), DfValue::from(3)].into(),
                         vec1![DfValue::from(4), DfValue::from(5), DfValue::from(6)].into()
@@ -1674,8 +1676,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1701,7 +1703,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![KeyComparison::Range((
                         Bound::Included(vec1![
                             DfValue::from(1),
@@ -1720,8 +1722,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1747,7 +1749,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![KeyComparison::Range(
                         vec1![DfValue::from(1), DfValue::from(2), DfValue::from(3)]
                             .range_from_inclusive()
@@ -1758,8 +1760,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,

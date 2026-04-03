@@ -976,11 +976,12 @@ impl Domain {
         // (which in the case of remapped upqueries might be different than the columns we missed
         // on!)
         let mut needed_replays: HashMap<_, Vec<KeyComparison>> = Default::default();
+        let column_indices: Arc<[_]> = Arc::from(miss_columns);
 
         for (replay_key, miss_key) in missed_keys {
             let miss = ColumnMiss {
                 node: miss_in,
-                column_indices: miss_columns.to_vec(),
+                column_indices: Arc::clone(&column_indices),
                 missed_keys: vec1![miss_key],
             };
             let misses = if is_generated {
@@ -1027,7 +1028,7 @@ impl Domain {
                     if state.is_partial() {
                         self.remapped_keys.insert(
                             miss_in,
-                            miss_columns.to_vec(),
+                            Arc::clone(&column_indices),
                             replay_key.clone(),
                             upstream_miss.clone(),
                         )
@@ -1062,7 +1063,6 @@ impl Domain {
                 let replays = needed_replays
                     .entry((Target(node), column_indices.clone()))
                     .or_default();
-                let column_indices: Arc<[usize]> = Arc::from(column_indices.as_slice());
                 for miss_key in missed_keys {
                     if w.record_miss(
                         node,
@@ -2895,11 +2895,12 @@ impl Domain {
             let cols = &index.columns;
             let is_generated = self.replay_paths.columns_are_generated(src, cols);
             let mut evictions: HashMap<_, Vec<KeyComparison>> = Default::default();
+            let column_indices: Arc<[_]> = Arc::from(cols.as_slice());
 
             for key in keys {
                 let m = ColumnMiss {
                     node: src,
-                    column_indices: cols.to_vec(),
+                    column_indices: Arc::clone(&column_indices),
                     missed_keys: vec1![key],
                 };
                 let keys = if is_generated {
@@ -2927,8 +2928,8 @@ impl Domain {
                                             &miss.missed_keys,
                                         ) {
                                             let mut column_indices = join.on_left();
-                                            column_indices.extend(miss.column_indices.clone());
-                                            miss.column_indices = column_indices;
+                                            column_indices.extend_from_slice(&miss.column_indices);
+                                            miss.column_indices = column_indices.into();
                                             if let Ok(remapped_keys_vec1) =
                                                 Vec1::try_from_vec(remapped_keys)
                                             {
@@ -2948,8 +2949,8 @@ impl Domain {
                                             &miss.missed_keys,
                                         ) {
                                             let mut column_indices = join.on_right();
-                                            column_indices.extend(miss.column_indices.clone());
-                                            miss.column_indices = column_indices;
+                                            column_indices.extend_from_slice(&miss.column_indices);
+                                            miss.column_indices = column_indices.into();
                                             if let Ok(remapped_keys_vec1) =
                                                 Vec1::try_from_vec(remapped_keys)
                                             {
