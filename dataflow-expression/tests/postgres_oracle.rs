@@ -29,7 +29,7 @@ fn config() -> Config {
     config
 }
 
-fn postgres_eval(expr: &str, client: &mut Client) -> Result<DfValue, anyhow::Error> {
+fn postgres_eval(expr: &str, client: &mut Client) -> Result<DfValue, postgres::Error> {
     Ok(client.query_one(&format!("SELECT {expr};"), &[])?.get(0))
 }
 
@@ -306,10 +306,12 @@ mod extract {
                 );
             }
             (Err(pg_err), Err(our_err)) => {
+                let pg_err_str = readyset_errors::postgres_err(&pg_err);
+
                 let mut asserted = false;
-                if re.is_match(&pg_err.to_string()) {
+                if re.is_match(&pg_err_str) {
                     if let Some((our_err, pg_err)) =
-                        extract_message_body(&our_err.to_string(), &pg_err.to_string())
+                        extract_message_body(&our_err.to_string(), &pg_err_str)
                     {
                         assert_eq!(
                             our_err, pg_err,
@@ -321,7 +323,7 @@ mod extract {
                 if !asserted {
                     assert_eq!(
                         our_err.to_string(),
-                        pg_err.to_string(),
+                        pg_err_str,
                         "mismatched error message for {expr} (left: us, right: postgres)"
                     );
                 }

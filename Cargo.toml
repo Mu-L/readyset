@@ -1,10 +1,10 @@
 [patch.crates-io]
 mysql_async = { git = "https://github.com/readysettech/mysql_async", branch="gtid_tags" }
 mysql_common = { git = "https://github.com/readysettech/rust_mysql_common" }
-postgres = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20250218" }
-postgres-protocol = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20250218" }
-postgres-types = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20250218" }
-tokio-postgres = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20250218" }
+postgres = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20260324" }
+postgres-protocol = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20260324" }
+postgres-types = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20260324" }
+tokio-postgres = { git = "https://github.com/readysettech/rust-postgres.git", tag = "readyset-20260324" }
 
 [workspace]
 members = [
@@ -80,15 +80,13 @@ resolver = "2"
 # FORKED DEPENDENCIES
 ########################
 
-# overridden in the patch section above
-mysql_async = { version = "0.36.1", features = ["native-tls-tls"] }
-
-# some of these are overridden in the patch section above
-postgres = "0.19.9"
-postgres-native-tls = "0.5.0"
-postgres-protocol = "0.6.7"
-postgres-types = "0.2.8"
-tokio-postgres = "0.7.12"
+# versions are overridden by [patch.crates-io] above
+mysql_async = { version = "*", features = ["native-tls-tls"] }
+mysql_common = "*"
+postgres = "*"
+postgres-protocol = "*"
+postgres-types = "*"
+tokio-postgres = "*"
 
 ########################
 # STANDARD DEPENDENCIES
@@ -186,7 +184,6 @@ md5 = "0.8.0"
 metrics = "0.24.0"
 metrics-exporter-prometheus = { version = "0.18.1", default-features = false }
 metrics-util = "0.20.0"
-mysql_common = "0.36.2"
 native-tls = "0.2.11"
 ndarray = "0.17.2"
 nom = "7.1.3"
@@ -211,6 +208,7 @@ pem = "3.0.5"
 petgraph = "0.6"
 pin-project = "1.1"
 pprof = "0.15"
+postgres-native-tls = "0.5.0"
 prometheus-parse = "0.2.5"
 pratt = "0.4.0"
 pretty_assertions = "1.4.0"

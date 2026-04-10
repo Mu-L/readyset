@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use readyset_errors::ReadySetError;
 use readyset_sql::{Dialect, DialectDisplay};
 use readyset_sql_parsing::ParsingPreset;
 use readyset_sql_passes::anonymize::{Anonymize, Anonymizer};
@@ -186,13 +185,6 @@ impl fmt::Display for CreateSchema {
 
 fn strip_backticks(table: &mut String) {
     table.retain(|c| c != '`');
-}
-
-/// Checks if the passed in ReadySetError is due to the slot slot_name not existing, such as from
-/// when trying to drop a replication slot which doesn't exist
-pub fn error_is_slot_not_found(err: &ReadySetError, slot_name: &str) -> bool {
-    err.to_string()
-        .ends_with(&format!("replication slot \"{slot_name}\" does not exist"))
 }
 
 #[cfg(test)]

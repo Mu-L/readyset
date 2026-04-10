@@ -67,16 +67,23 @@ where
     T: MakeTlsConnect<pgsql::Socket> + Send,
     <T as MakeTlsConnect<pgsql::Socket>>::Stream: Send + 'static,
 {
-    let (client, conn) = config
-        .connect(tls)
-        .await
-        .map_err(|e| ReplicationFailed(format!("Failed to connect: {e}")))?;
+    let (client, conn) = config.connect(tls).await.map_err(|e| {
+        ReplicationFailed(format!(
+            "Failed to connect: {}",
+            readyset_errors::postgres_err(&e)
+        ))
+    })?;
     let conn_handle = tokio::spawn(conn);
     info!("Setting up DDL replication");
     client
         .batch_execute(include_str!("./ddl_replication.sql"))
         .await
-        .map_err(|e| ReplicationFailed(format!("Failed to install event triggers: {e}")))?;
+        .map_err(|e| {
+            ReplicationFailed(format!(
+                "Failed to install event triggers: {}",
+                readyset_errors::postgres_err(&e)
+            ))
+        })?;
     info!("Set up DDL replication");
     conn_handle.abort();
 

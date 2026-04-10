@@ -1270,10 +1270,16 @@ impl_from_to_string!(rmp_serde::encode::Error, SerializationFailed);
 impl_from_to_string!(rmp_serde::decode::Error, SerializationFailed);
 impl_from_to_string!(url::ParseError, UrlParseFailed);
 impl_from_to_string!(mysql_async::Error, ReplicationFailed);
-impl_from_to_string!(tokio_postgres::Error, ReplicationFailed);
 impl_from_to_string!(deadpool_postgres::PoolError, ReplicationFailed);
 impl_from_to_string!(deadpool_postgres::CreatePoolError, ReplicationFailed);
 impl_from_to_string!(deadpool_postgres::BuildError, ReplicationFailed);
+
+impl From<tokio_postgres::Error> for ReadySetError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::ReplicationFailed(postgres_err(&e))
+    }
+}
+
 impl_from_to_string!(io::Error, IOError);
 impl_from_to_string!(tikv_jemalloc_ctl::Error, JemallocCtlError);
 impl_from_to_string!(tokio_native_tls::native_tls::Error, NativeTlsError);
@@ -1320,6 +1326,20 @@ macro_rules! set_failpoint_return_err {
             }
         ));
     }};
+}
+
+/// Extract a human-readable error string from a `tokio_postgres::Error`.
+///
+/// The upstream `tokio_postgres::Error::Display` only shows the error kind
+/// (e.g., "db error"). This function uses [`as_db_error()`] to extract the
+/// structured [`DbError`] message when available, falling back to the
+/// top-level `Display` for non-DB errors (timeouts, connection errors, etc.).
+pub fn postgres_err(e: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = e.as_db_error() {
+        db_err.to_string()
+    } else {
+        e.to_string()
+    }
 }
 
 #[cfg(test)]

@@ -274,7 +274,12 @@ mod failpoint_tests {
             "expected CREATE CACHE to fail when OIB START failpoint is active, but it succeeded"
         );
 
-        let err_msg = result.unwrap_err().to_string().to_ascii_lowercase();
+        let err_msg = result
+            .unwrap_err()
+            .as_db_error()
+            .expect("expected db error")
+            .message()
+            .to_ascii_lowercase();
         assert!(
             err_msg.contains("background index build failed")
                 || err_msg.contains("failpoint")
@@ -322,7 +327,12 @@ mod failpoint_tests {
             "expected CREATE CACHE to fail when OIB POST_SCAN failpoint is active, but it succeeded"
         );
 
-        let err_msg = result.unwrap_err().to_string().to_ascii_lowercase();
+        let err_msg = result
+            .unwrap_err()
+            .as_db_error()
+            .expect("expected db error")
+            .message()
+            .to_ascii_lowercase();
         assert!(
             err_msg.contains("background index build failed")
                 || err_msg.contains("failpoint")
@@ -372,7 +382,12 @@ mod failpoint_tests {
             "expected CREATE CACHE to fail when OIB PRE_ACTIVATE failpoint is active, but it succeeded"
         );
 
-        let err_msg = result.unwrap_err().to_string().to_ascii_lowercase();
+        let err_msg = result
+            .unwrap_err()
+            .as_db_error()
+            .expect("expected db error")
+            .message()
+            .to_ascii_lowercase();
         assert!(
             err_msg.contains("background index build failed")
                 || err_msg.contains("failpoint")

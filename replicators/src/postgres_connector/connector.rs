@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -21,13 +20,12 @@ use readyset_util::select;
 use replication_offset::postgres::{CommitLsn, Lsn, PostgresPosition};
 use replication_offset::ReplicationOffset;
 use tokio_postgres as pgsql;
-use tokio_postgres::error::{DbError, SqlState};
+use tokio_postgres::error::SqlState;
 use tracing::{debug, error, info, trace, warn};
 
 use super::ddl_replication::setup_ddl_replication;
 use super::wal_reader::{WalEvent, WalReader};
 use super::PUBLICATION_NAME;
-use crate::db_util::error_is_slot_not_found;
 use crate::noria_adapter::{Connector, ReplicationAction};
 use crate::table_filter::TableFilter;
 
@@ -141,15 +139,18 @@ impl PostgresWalConnector {
         pg_config.dbname(dbname.as_ref()).set_replication_database();
 
         let (client, connection) = pg_config.connect(tls_connector).await.map_err(|e| {
-            if let Some(e) = e.source().and_then(|e| e.downcast_ref::<DbError>()) {
-                if e.code() == &SqlState::INVALID_AUTHORIZATION_SPECIFICATION {
+            if let Some(db_err) = e.as_db_error() {
+                if db_err.code() == &SqlState::INVALID_AUTHORIZATION_SPECIFICATION {
                     // Can be caused by rds.logical_replication = 0 on RDS.
                     return ReadySetError::ReplicationFailed(format!(
-                        "Failed to connect (remember to enable logical replication): {e}"
+                        "Failed to connect (remember to enable logical replication): {db_err}"
                     ));
                 }
             }
-            ReadySetError::ReplicationFailed(format!("Failed to connect: {e}"))
+            ReadySetError::ReplicationFailed(format!(
+                "Failed to connect: {}",
+                readyset_errors::postgres_err(&e)
+            ))
         })?;
         let connection_handle = tokio::spawn(connection);
         let status_update_interval = Duration::from_secs(config.status_update_interval_secs as u64);
@@ -207,20 +208,23 @@ impl PostgresWalConnector {
         );
 
         if !config.disable_create_publication {
-            match self.create_publication(PUBLICATION_NAME).await {
-                Ok(()) => {
+            let query = format!("CREATE PUBLICATION {PUBLICATION_NAME} FOR ALL TABLES");
+            match self.client.simple_query(&query).await {
+                Ok(_) => {
                     // Created a new publication, everything is good
                 }
-                Err(err)
-                    if err.to_string().contains("publication")
-                        && err.to_string().contains("already exists") =>
-                {
+                Err(e) if matches!(e.code(), Some(&SqlState::DUPLICATE_OBJECT)) => {
                     // This is an existing publication we are going to use
                 }
-                Err(err) if err.to_string().contains("permission denied") => {
+                Err(e) if matches!(e.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE)) => {
                     error!("Insufficient permissions to create publication FOR ALL TABLES");
                 }
-                Err(err) => return Err(err),
+                Err(e) => {
+                    return Err(ReadySetError::ReplicationFailed(format!(
+                        "Failed to create publication: {}",
+                        readyset_errors::postgres_err(&e)
+                    )))
+                }
             }
         }
 
@@ -228,8 +232,7 @@ impl PostgresWalConnector {
         self.drop_replication_slot(repl_slot_name).await?;
 
         match self.create_replication_slot(repl_slot_name, false).await {
-            Ok(slot) => self.replication_slot = Some(slot), /* Created a new slot, */
-            // everything is good
+            Ok(slot) => self.replication_slot = Some(slot),
             Err(err)
                 if err.to_string().contains("replication slot")
                     && err.to_string().contains("already exists") =>
@@ -292,16 +295,6 @@ impl PostgresWalConnector {
             xlogpos,
             dbname,
         })
-    }
-
-    /// Creates a new `PUBLICATION name FOR ALL TABLES`, to be able to receive WAL on that slot.
-    /// The user must have superuser privileges for that to work.
-    async fn create_publication(&mut self, name: &str) -> ReadySetResult<()> {
-        let query = format!("CREATE PUBLICATION {name} FOR ALL TABLES");
-        self.simple_query(&query).await.map_err(|e| {
-            ReadySetError::ReplicationFailed(format!("Failed to create publication: {e}"))
-        })?;
-        Ok(())
     }
 
     /// Creates a new replication slot on the primary.
@@ -550,24 +543,18 @@ impl PostgresWalConnector {
 /// Not really needed when `TEMPORARY` slot is Used
 pub async fn drop_replication_slot(client: &mut pgsql::Client, name: &str) -> ReadySetResult<()> {
     info!(slot = name, "Dropping replication slot if exists");
-    // SQL command to drop the replication slot over replication connection
     let formatted_command = format!("DROP_REPLICATION_SLOT {name}");
 
-    let res: ReadySetResult<Vec<pgsql::SimpleQueryMessage>> = client
-        .simple_query(&formatted_command)
-        .await
-        .map_err(ReadySetError::from);
-
-    match res {
+    match client.simple_query(&formatted_command).await {
         Ok(_) => Ok(()),
-        Err(err) if error_is_slot_not_found(&err, name) => {
+        Err(e) if matches!(e.code(), Some(&SqlState::UNDEFINED_OBJECT)) => {
             debug!(
                 slot = name,
                 "Replication slot to-drop already doesn't exist"
             );
             Ok(())
         }
-        Err(err) => Err(err),
+        Err(e) => Err(ReadySetError::from(e)),
     }
 }
 

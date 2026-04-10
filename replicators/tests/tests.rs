@@ -28,7 +28,6 @@ use readyset_telemetry_reporter::{TelemetryEvent, TelemetryInitializer, Telemetr
 use readyset_util::failpoints;
 use readyset_util::shutdown::ShutdownSender;
 use readyset_util::{eventually, retry_with_exponential_backoff};
-use replicators::db_util::error_is_slot_not_found;
 use replicators::table_filter::TableFilter;
 use replicators::{
     ControllerMessage, ControllerMessageDiscriminants, NoriaAdapter, ReplicatorMessage,
@@ -2906,23 +2905,34 @@ async fn postgresql_drop_nonexistent_replication_slot() {
 
     let _conn = tokio::spawn(async move { conn.await.unwrap() });
 
-    // This slot shouldn't exist, and should generate a corresponding "error", which we will usually
-    // want to instead consider good enough from replication's point of view
-    let slot_name = "doesnotexist";
-    let res = client
-        .simple_query(&format!("DROP_REPLICATION_SLOT {slot_name}"))
-        .await;
-    assert!(error_is_slot_not_found(&res.unwrap_err().into(), slot_name));
+    // Dropping a non-existent slot should produce UNDEFINED_OBJECT
+    let err = client
+        .simple_query("DROP_REPLICATION_SLOT doesnotexist")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().map(|db| db.code().clone()),
+        Some(SqlState::UNDEFINED_OBJECT),
+        "expected UNDEFINED_OBJECT for non-existent slot, got: {err}"
+    );
 
-    // Different type of error shouldn't pass the check
-    let slot_name = "invalid syntax";
-    let res = client
-        .simple_query(&format!("DROP_REPLICATION_SLOT {slot_name}"))
-        .await;
-    assert!(!error_is_slot_not_found(
-        &res.unwrap_err().into(),
-        slot_name
-    ));
+    // Verify postgres_err delegates to as_db_error() for DB errors
+    assert_eq!(
+        readyset_errors::postgres_err(&err),
+        err.as_db_error().unwrap().to_string(),
+        "postgres_err should return DbError::Display for DB errors"
+    );
+
+    // A syntax error should NOT produce UNDEFINED_OBJECT
+    let err = client
+        .simple_query("DROP_REPLICATION_SLOT invalid syntax")
+        .await
+        .unwrap_err();
+    assert_ne!(
+        err.as_db_error().map(|db| db.code().clone()),
+        Some(SqlState::UNDEFINED_OBJECT),
+        "syntax error should not be UNDEFINED_OBJECT"
+    );
 }
 
 /// Given a table, check that it has an associated TOAST table
