@@ -46,6 +46,7 @@ members = [
     "readyset-e2e-tests",
     "readyset-errors",
     "readyset-logictest",
+    "readyset-mcp",
     "readyset-mir",
     "readyset-mysql",
     "readyset-psql",
