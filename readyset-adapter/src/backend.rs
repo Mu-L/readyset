@@ -5113,7 +5113,10 @@ where
                     | SqlQuery::AlterReadySet(_)
                     | SqlQuery::Explain(_)
                     | SqlQuery::CreateRls(_)
-                    | SqlQuery::DropRls(_) => {
+                    | SqlQuery::DropRls(_)
+                    | SqlQuery::CreateMcpToken(_)
+                    | SqlQuery::DropMcpToken(_)
+                    | SqlQuery::AlterMcpToken(_) => {
                         unreachable!("path returns prior")
                     }
                 }

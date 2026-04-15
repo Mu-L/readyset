@@ -211,11 +211,14 @@ enum ReadysetKeyword {
     ENTRIES,
     EVICTION,
     EXIT,
+    EXPIRES,
     MAINTENANCE,
     MATERIALIZATIONS,
+    MCP,
     MEMORY,
     MIGRATION,
     MS,
+    NEVER,
     PERIOD,
     PATHS,
     POLICY,
@@ -226,10 +229,13 @@ enum ReadysetKeyword {
     REPLAY,
     RESNAPSHOT,
     RSA,
+    SCOPE,
     SHALLOW,
     SIMPLIFIED,
     STOP,
     SUPPORTED,
+    TOKEN,
+    TOKENS,
     TTL,
     UPSTREAM,
     /// To match both Readyset and sqlparser keywords in one go, we want to be able to accept both
@@ -248,11 +254,14 @@ impl ReadysetKeyword {
             Self::ENTRIES => "ENTRIES",
             Self::EVICTION => "EVICTION",
             Self::EXIT => "EXIT",
+            Self::EXPIRES => "EXPIRES",
             Self::MAINTENANCE => "MAINTENANCE",
             Self::MATERIALIZATIONS => "MATERIALIZATIONS",
+            Self::MCP => "MCP",
             Self::MEMORY => "MEMORY",
             Self::MIGRATION => "MIGRATION",
             Self::MS => "MS",
+            Self::NEVER => "NEVER",
             Self::PERIOD => "PERIOD",
             Self::PATHS => "PATHS",
             Self::POLICY => "POLICY",
@@ -263,10 +272,13 @@ impl ReadysetKeyword {
             Self::REPLAY => "REPLAY",
             Self::RESNAPSHOT => "RESNAPSHOT",
             Self::RSA => "RSA",
+            Self::SCOPE => "SCOPE",
             Self::SHALLOW => "SHALLOW",
             Self::SIMPLIFIED => "SIMPLIFIED",
             Self::STOP => "STOP",
             Self::SUPPORTED => "SUPPORTED",
+            Self::TOKEN => "TOKEN",
+            Self::TOKENS => "TOKENS",
             Self::TTL => "TTL",
             Self::UPSTREAM => "UPSTREAM",
             Self::Standard(_) => panic!(
@@ -490,6 +502,8 @@ fn parse_alter(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readys
                 parser.peek_token()
             )))
         }
+    } else if parse_readyset_keywords(parser, &[ReadysetKeyword::MCP, ReadysetKeyword::TOKEN]) {
+        parse_alter_mcp_token_body(parser)
     } else {
         Ok(parser.parse_alter()?.try_into_dialect(dialect)?)
     }
@@ -525,6 +539,29 @@ fn parse_duration_with_unit(
         ReadysetParsingError::ReadysetParsingError(format!("couldn't parse {context} duration"))
     })?;
     parse_duration_unit(parser, value, context)
+}
+
+/// Parse the tail of `ALTER MCP TOKEN '<name>' SET (EXPIRES '<datetime>' | NEVER EXPIRES)`.
+/// The `ALTER MCP TOKEN` keywords must already be consumed.
+fn parse_alter_mcp_token_body(parser: &mut Parser) -> Result<SqlQuery, ReadysetParsingError> {
+    let name = parser.parse_literal_string()?;
+    parser.expect_keyword(Keyword::SET)?;
+
+    let expires =
+        if parse_readyset_keywords(parser, &[ReadysetKeyword::NEVER, ReadysetKeyword::EXPIRES]) {
+            readyset_sql::ast::McpTokenExpiresChange::Never
+        } else if parse_readyset_keyword(parser, ReadysetKeyword::EXPIRES) {
+            let s = parser.parse_literal_string()?;
+            readyset_sql::ast::McpTokenExpiresChange::At(s)
+        } else {
+            return Err(ReadysetParsingError::ReadysetParsingError(
+                "expected EXPIRES or NEVER EXPIRES after SET".into(),
+            ));
+        };
+
+    Ok(SqlQuery::AlterMcpToken(
+        readyset_sql::ast::AlterMcpTokenStatement { name, expires },
+    ))
 }
 
 /// Parse cache options (POLICY, TTL, REFRESH, COALESCE, ALWAYS, CONCURRENTLY) from the token
@@ -765,6 +802,91 @@ fn parse_optional_cache_type(parser: &mut Parser) -> Option<CacheType> {
     } else {
         None
     }
+}
+
+/// Peek ahead to see if the next statement is `CREATE MCP TOKEN`. Restores the
+/// parser position before returning.
+fn peek_create_mcp_token(parser: &mut Parser) -> bool {
+    let backup = |parser: &mut Parser<'_>, n| {
+        for _ in 0..n {
+            parser.prev_token();
+        }
+    };
+
+    if !parser.parse_keyword(Keyword::CREATE) {
+        return false;
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::MCP) {
+        backup(parser, 1);
+        return false;
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::TOKEN) {
+        backup(parser, 2);
+        return false;
+    }
+    backup(parser, 3);
+    true
+}
+
+/// Parse a scope keyword: read_only | cache_admin | full.
+fn parse_mcp_scope(
+    parser: &mut Parser,
+) -> Result<readyset_sql::ast::McpTokenScope, ReadysetParsingError> {
+    let ident = parser.parse_identifier()?;
+    match ident.value.to_ascii_lowercase().as_str() {
+        "read_only" => Ok(readyset_sql::ast::McpTokenScope::ReadOnly),
+        "cache_admin" => Ok(readyset_sql::ast::McpTokenScope::CacheAdmin),
+        "full" => Ok(readyset_sql::ast::McpTokenScope::Full),
+        other => Err(ReadysetParsingError::ReadysetParsingError(format!(
+            "expected scope read_only, cache_admin, or full, got {other}"
+        ))),
+    }
+}
+
+/// Parse `CREATE MCP TOKEN '<name>' [WITH SCOPE <scope>] [EXPIRES '<datetime>']`.
+/// The CREATE keyword must not yet be consumed.
+fn parse_create_mcp_token(parser: &mut Parser) -> Result<SqlQuery, ReadysetParsingError> {
+    if !parser.parse_keyword(Keyword::CREATE) {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "expected CREATE".into(),
+        ));
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::MCP) {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "expected MCP after CREATE".into(),
+        ));
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::TOKEN) {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "expected TOKEN after CREATE MCP".into(),
+        ));
+    }
+    let name = parser.parse_literal_string()?;
+
+    let scope = if parser.parse_keyword(Keyword::WITH) {
+        if !parse_readyset_keyword(parser, ReadysetKeyword::SCOPE) {
+            return Err(ReadysetParsingError::ReadysetParsingError(
+                "expected SCOPE after WITH".into(),
+            ));
+        }
+        Some(parse_mcp_scope(parser)?)
+    } else {
+        None
+    };
+
+    let expires = if parse_readyset_keyword(parser, ReadysetKeyword::EXPIRES) {
+        Some(parser.parse_literal_string()?)
+    } else {
+        None
+    };
+
+    Ok(SqlQuery::CreateMcpToken(
+        readyset_sql::ast::CreateMcpTokenStatement {
+            name,
+            scope,
+            expires,
+        },
+    ))
 }
 
 fn parse_create_cache_keywords(
@@ -1049,6 +1171,8 @@ fn parse_show(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readyse
         Ok(SqlQuery::Show(
             readyset_sql::ast::ShowStatement::ReplayPaths,
         ))
+    } else if parse_readyset_keywords(parser, &[ReadysetKeyword::MCP, ReadysetKeyword::TOKENS]) {
+        Ok(SqlQuery::Show(readyset_sql::ast::ShowStatement::McpTokens))
     } else {
         Ok(parser.parse_show()?.try_into_dialect(dialect)?)
     }
@@ -1086,6 +1210,11 @@ fn parse_drop(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readyse
     } else if parser.parse_keyword(Keyword::CACHE) {
         let name = parser.parse_object_name(false)?.try_into_dialect(dialect)?;
         Ok(SqlQuery::DropCache(DropCacheStatement { name }))
+    } else if parse_readyset_keywords(parser, &[ReadysetKeyword::MCP, ReadysetKeyword::TOKEN]) {
+        let name = parser.parse_literal_string()?;
+        Ok(SqlQuery::DropMcpToken(
+            readyset_sql::ast::DropMcpTokenStatement { name },
+        ))
     } else {
         Ok(parser.parse_drop()?.try_into_dialect(dialect)?)
     }
@@ -1170,6 +1299,8 @@ fn parse_readyset_query(
 ) -> Result<SqlQuery, ReadysetParsingError> {
     if parser.parse_keyword(Keyword::ALTER) {
         parse_alter(parser, dialect)
+    } else if peek_create_mcp_token(parser) {
+        parse_create_mcp_token(parser)
     } else if peek_create_cache(parser) {
         parse_create_cache(parser, dialect, input)
     } else if parser.parse_keyword(Keyword::DROP) {

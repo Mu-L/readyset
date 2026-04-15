@@ -34,6 +34,8 @@ pub enum ShowStatement {
     },
     /// SHOW READYSET RSA PUBLIC KEY
     ReadySetRsaPublicKey,
+    /// SHOW MCP TOKENS — list all active MCP authentication tokens.
+    McpTokens,
 }
 
 impl DialectDisplay for ShowStatement {
@@ -104,6 +106,7 @@ impl DialectDisplay for ShowStatement {
                 Self::ReadySetRsaPublicKey => {
                     write!(f, "READYSET RSA PUBLIC KEY")
                 }
+                Self::McpTokens => write!(f, "MCP TOKENS"),
             }
         })
     }

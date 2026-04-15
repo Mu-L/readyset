@@ -22,6 +22,7 @@ use crate::drop::{
 use crate::explain::explain_statement;
 use crate::expression::expression;
 use crate::insert::insertion;
+use crate::mcp_token::{alter_mcp_token, create_mcp_token, drop_mcp_token};
 use crate::rename::rename_table;
 use crate::rls::{create_rls, drop_rls};
 use crate::select::selection;
@@ -92,6 +93,9 @@ fn sql_query_part2(
             map(flush_all_shallow_caches, SqlQuery::FlushAllShallowCaches),
             map(flush_cache(dialect), SqlQuery::FlushCache),
             map(alter_readyset_statement(dialect), SqlQuery::AlterReadySet),
+            map(create_mcp_token(dialect), SqlQuery::CreateMcpToken),
+            map(drop_mcp_token(dialect), SqlQuery::DropMcpToken),
+            map(alter_mcp_token(dialect), SqlQuery::AlterMcpToken),
             // This does a more expensive clone of `i`, so process it last.
             map(create_cached_query(dialect), SqlQuery::CreateCache),
             map(comment(dialect), SqlQuery::Comment),

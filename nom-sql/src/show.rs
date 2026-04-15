@@ -8,6 +8,7 @@ use readyset_sql::{ast::*, Dialect};
 
 use crate::dialect::DialectParser;
 use crate::expression::expression;
+use crate::mcp_token::mcp_tokens_show;
 use crate::rls::parse_rest_of_drop_or_show_rls;
 use crate::whitespace::{whitespace0, whitespace1};
 use crate::{literal, NomSqlResult};
@@ -206,6 +207,7 @@ pub fn show(dialect: Dialect) -> impl Fn(LocatedSpan<&[u8]>) -> NomSqlResult<&[u
             value(ShowStatement::Events, tag_no_case("events")),
             value(ShowStatement::Connections, tag_no_case("connections")),
             value(ShowStatement::Databases, tag_no_case("databases")),
+            value(ShowStatement::McpTokens, mcp_tokens_show),
         ))(i)?;
         Ok((i, statement))
     }

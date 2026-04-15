@@ -1495,6 +1495,9 @@ pub fn walk_sql_query<'a, V: Visitor<'a>>(
         SqlQuery::CreateDatabase(statement) => visitor.visit_create_database_statement(statement),
         SqlQuery::CreateRls(statement) => visitor.visit_create_rls_statement(statement),
         SqlQuery::DropRls(statement) => visitor.visit_drop_rls_statement(statement),
+        SqlQuery::CreateMcpToken(_) | SqlQuery::DropMcpToken(_) | SqlQuery::AlterMcpToken(_) => {
+            Ok(())
+        }
     }
 }
 

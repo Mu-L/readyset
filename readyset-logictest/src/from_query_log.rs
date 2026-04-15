@@ -115,7 +115,10 @@ fn is_ddl(query: &SqlQuery) -> bool {
         | SqlQuery::Explain(_)
         | SqlQuery::Deallocate(_)
         | SqlQuery::Truncate(_)
-        | SqlQuery::Comment(_) => false,
+        | SqlQuery::Comment(_)
+        | SqlQuery::CreateMcpToken(_)
+        | SqlQuery::DropMcpToken(_)
+        | SqlQuery::AlterMcpToken(_) => false,
         SqlQuery::CreateDatabase(_)
         | SqlQuery::CreateTable(_)
         | SqlQuery::CreateView(_)

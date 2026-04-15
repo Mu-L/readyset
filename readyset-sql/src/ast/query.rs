@@ -56,6 +56,12 @@ pub enum SqlQuery {
     CreateRls(CreateRlsStatement),
     #[weight(0)]
     DropRls(DropRlsStatement),
+    #[weight(0)]
+    CreateMcpToken(CreateMcpTokenStatement),
+    #[weight(0)]
+    DropMcpToken(DropMcpTokenStatement),
+    #[weight(0)]
+    AlterMcpToken(AlterMcpTokenStatement),
 }
 
 impl DialectDisplay for SqlQuery {
@@ -93,6 +99,9 @@ impl DialectDisplay for SqlQuery {
             Self::CreateDatabase(create) => write!(f, "{}", create.display(dialect)),
             Self::CreateRls(create_rls) => write!(f, "{}", create_rls.display(dialect)),
             Self::DropRls(drop_rls) => write!(f, "{}", drop_rls.display(dialect)),
+            Self::CreateMcpToken(create) => write!(f, "{}", create.display(dialect)),
+            Self::DropMcpToken(drop) => write!(f, "{}", drop.display(dialect)),
+            Self::AlterMcpToken(a) => write!(f, "{}", a.display(dialect)),
         })
     }
 }
@@ -308,6 +317,9 @@ impl SqlQuery {
             Self::Truncate(_) => "TRUNCATE",
             Self::CreateRls(_) => "CREATE RLS",
             Self::DropRls(_) => "DROP RLS",
+            Self::CreateMcpToken(_) => "CREATE MCP TOKEN",
+            Self::DropMcpToken(_) => "DROP MCP TOKEN",
+            Self::AlterMcpToken(_) => "ALTER MCP TOKEN",
         }
     }
 
@@ -349,12 +361,16 @@ impl SqlQuery {
                 | ShowStatement::Connections
                 | ShowStatement::Rls(_)
                 | ShowStatement::ReplayPaths
-                | ShowStatement::ShallowCacheEntries { .. } => true,
+                | ShowStatement::ShallowCacheEntries { .. }
+                | ShowStatement::McpTokens => true,
                 // Handled by the MySQL query handler via the
                 // requires_fallback + return_default_response path.
                 ShowStatement::ReadySetRsaPublicKey => false,
             },
             SqlQuery::CreateRls(_) | SqlQuery::DropRls(_) => true,
+            SqlQuery::CreateMcpToken(_)
+            | SqlQuery::DropMcpToken(_)
+            | SqlQuery::AlterMcpToken(_) => true,
             SqlQuery::CreateDatabase(_)
             | SqlQuery::CreateTable(_)
             | SqlQuery::CreateView(_)
