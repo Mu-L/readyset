@@ -9,6 +9,7 @@ edition = "2024"
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+axum = "0.8"
 bincode = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -29,6 +30,8 @@ mysql_common = { workspace = true }
 parking_lot = { workspace = true }
 quanta = { workspace = true }
 rand = { workspace = true }
+rmcp = { version = "1.4", features = ["server", "transport-streamable-http-server", "macros"] }
+schemars = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 slab = { workspace = true }
@@ -37,6 +40,7 @@ sqlparser = { workspace = true }
 streaming-iterator = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = "0.7"
 tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 vec1 = { workspace = true }
@@ -54,6 +58,7 @@ readyset-common = { path = "../readyset-common" }
 readyset-data = { path = "../readyset-data/" }
 readyset-dataflow = { path = "../readyset-dataflow" }
 readyset-errors = { path = "../readyset-errors" }
+readyset-mcp = { path = "../readyset-mcp" }
 readyset-schema = { path = "../readyset-schema" }
 readyset-server = { path = "../readyset-server" }
 readyset-shallow = { path = "../readyset-shallow" }

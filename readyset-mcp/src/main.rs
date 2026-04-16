@@ -1,12 +1,8 @@
-mod connection;
-mod server;
-
 use anyhow::{Context, Result};
+use readyset_mcp::connection::{ConnectionConfig, ReadysetConnection};
+use readyset_mcp::server::ReadysetMcpServer;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-
-use connection::{ConnectionConfig, ReadysetConnection};
-use server::ReadysetMcpServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {

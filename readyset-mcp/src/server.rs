@@ -206,6 +206,13 @@ impl ReadysetMcpServer {
             conn: Arc::new(conn),
         }
     }
+
+    /// Construct a server that shares an existing connection pool. Used by the
+    /// embedded HTTP transport, where each MCP session gets its own handler
+    /// but all handlers reuse the same pool.
+    pub fn from_shared(conn: Arc<ReadysetConnection>) -> Self {
+        Self { conn }
+    }
 }
 
 /// Format query result rows into a readable string for the LLM.

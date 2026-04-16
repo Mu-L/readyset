@@ -1,6 +1,7 @@
 #![deny(unreachable_pub)]
 pub mod backend;
 pub mod http_router;
+pub mod mcp_http;
 pub mod metrics_handle;
 pub mod migration_handler;
 pub mod proxied_queries_reporter;

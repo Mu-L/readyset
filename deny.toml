@@ -169,6 +169,7 @@ skip-tree = [
     { name = "petgraph", version = "0.6.5" },
     { name = "pyroscope", version = "0.5.8" },
     { name = "pyroscope_pprofrs", version = "0.2.10" },
+    { name = "rand", version = "0.10.1" },
     { name = "rusty-fork", version = "0.3.0" },
     { name = "sqlparser", version = "0.59.0" },
     { name = "tower", version = "0.4.13" },

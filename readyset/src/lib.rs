@@ -254,6 +254,17 @@ pub struct Options {
     #[arg(long, env = "METRICS_ADDRESS", default_value = "0.0.0.0:6034")]
     metrics_address: SocketAddr,
 
+    /// Enable the embedded MCP (Model Context Protocol) HTTP server.
+    /// Allows AI assistants to interact with this Readyset instance.
+    #[arg(long, env = "ENABLE_MCP", default_value = "false")]
+    enable_mcp: bool,
+
+    /// IP:PORT for the MCP HTTP server (only used when --enable-mcp is set).
+    /// Defaults to the loopback interface; bind to a non-loopback address only
+    /// behind a TLS-terminating proxy — the endpoint speaks plaintext HTTP.
+    #[arg(long, env = "MCP_ADDRESS", default_value = "127.0.0.1:6035")]
+    mcp_address: SocketAddr,
+
     /// Comma list of allowed usernames:passwords to authenticate database connections with.
     /// If not set, the username and password in --upstream-db-url will be used.
     /// If --allow-unauthenticated-connections is passed, this will be ignored.
@@ -892,6 +903,8 @@ pub fn init_adapter_tracing(
 impl<H> NoriaAdapter<H>
 where
     H: ConnectionHandler + Clone + Send + Sync + 'static,
+    H::UpstreamDatabase: Sync,
+    <H::UpstreamDatabase as UpstreamDatabase>::StatementMeta: Sync,
 {
     pub fn run(&mut self, rt: tokio::runtime::Runtime, options: Options) -> anyhow::Result<()> {
         info!(?options, "Starting Readyset adapter");
@@ -1351,6 +1364,38 @@ where
 
         let memory_limit = options.server_worker_options.memory_limit;
 
+        // Extract upstream-db-url credentials for the MCP loopback connection
+        // before `server_worker_options` is moved into the server builder.
+        // These are guaranteed to be in the adapter's `allowed_users` (they're
+        // merged in by `build_allowed_users`) and valid on upstream.
+        //
+        // When `--enable-mcp` is set we require the credentials to be present;
+        // silently starting without the MCP endpoint would hide a
+        // configuration error from the operator.
+        let mcp_sql_creds: Option<(String, String)> = if options.enable_mcp {
+            let parsed = options
+                .server_worker_options
+                .replicator_config
+                .upstream_db_url
+                .as_ref()
+                .and_then(|s| s.parse::<database_utils::DatabaseURL>().ok())
+                .and_then(|url| match (url.user(), url.password()) {
+                    (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+                    _ => None,
+                });
+            if parsed.is_none() {
+                error!(
+                    "--enable-mcp requires --upstream-db-url to include a \
+                     username and password; the MCP endpoint authenticates \
+                     its loopback SQL connection with them"
+                );
+                process::exit(1);
+            }
+            parsed
+        } else {
+            None
+        };
+
         // Run a readyset-server instance within this adapter.
         let internal_server_handle = if options.deployment_mode.has_reader_nodes() {
             let authority = options.authority.clone();
@@ -1489,6 +1534,109 @@ where
             &repl_lag,
             query_status_cache,
         )?;
+
+        // MCP tool calls dispatch via a loopback SQL connection to the
+        // adapter's own SQL listener — so they reuse the full per-client
+        // Backend pipeline (parsing, rewriting, upstream fallback) instead
+        // of a parallel Backend. The loopback connection authenticates as
+        // the upstream-db-url user (guaranteed to be in allowed_users and
+        // valid on upstream); the bearer token gates HTTP access and tool
+        // scope. All bearers share this single upstream identity.
+        let _mcp_handle: Option<tokio::task::JoinHandle<()>> =
+            if let (true, Some((mcp_user, mcp_password))) = (options.enable_mcp, mcp_sql_creds) {
+                let mcp_authority = adapter_authority.clone();
+                let mcp_http_addr = options.mcp_address;
+                // Resolve a loopback target reachable by one of the bound
+                // listeners. Prefer a literal loopback address (127.0.0.1 or
+                // ::1) if the adapter already binds one; otherwise derive a
+                // family-matched loopback from the first bound address
+                // (0.0.0.0 -> 127.0.0.1, :: -> ::1) so we still reach the
+                // listener on v6-only systems and on macOS where [::] does
+                // not accept v4-mapped clients.
+                let (mcp_sql_host, mcp_sql_port) = listen_addresses
+                    .iter()
+                    .find(|a| a.ip().is_loopback())
+                    .map(|a| (a.ip().to_string(), a.port()))
+                    .unwrap_or_else(|| {
+                        let a = listen_addresses[0];
+                        let host = match a.ip() {
+                            IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+                            IpAddr::V6(ip) if ip.is_unspecified() => "::1".to_string(),
+                            other => other.to_string(),
+                        };
+                        (host, a.port())
+                    });
+                let mcp_dialect = self.parse_dialect;
+                // If the adapter's SQL listener requires TLS, the loopback
+                // connection from MCP must negotiate TLS too. Verification is
+                // skipped because the adapter's cert is unlikely to be valid
+                // for 127.0.0.1 / ::1, and there is no MITM threat on a
+                // connection from the same process to itself.
+                let mcp_require_tls = matches!(options.tls_mode, TlsMode::Required);
+                let mut mcp_shutdown = shutdown_rx.clone();
+
+                Some(rt.handle().spawn(async move {
+                    let db_type = match mcp_dialect {
+                        readyset_sql::Dialect::MySQL => readyset_mcp::connection::DbType::Mysql,
+                        readyset_sql::Dialect::PostgreSQL => {
+                            readyset_mcp::connection::DbType::Postgres
+                        }
+                    };
+                    let (mcp_tls_mode, mcp_tls_disable_verification) = if mcp_require_tls {
+                        (readyset_mcp::connection::TlsMode::Require, true)
+                    } else {
+                        (readyset_mcp::connection::TlsMode::Disable, false)
+                    };
+                    let config = readyset_mcp::connection::ConnectionConfig {
+                        host: mcp_sql_host,
+                        port: mcp_sql_port,
+                        user: mcp_user,
+                        password: mcp_password,
+                        database: None,
+                        db_type,
+                        tls_mode: mcp_tls_mode,
+                        tls_root_cert: None,
+                        tls_disable_verification: mcp_tls_disable_verification,
+                    };
+
+                    let conn =
+                        match readyset_mcp::connection::ReadysetConnection::new(&config).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "failed to open loopback SQL connection for MCP"
+                                );
+                                return;
+                            }
+                        };
+                    let mcp_server = readyset_mcp::server::ReadysetMcpServer::new(conn);
+
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let cancel_for_shutdown = cancel.clone();
+                    tokio::spawn(async move {
+                        mcp_shutdown.recv().await;
+                        cancel_for_shutdown.cancel();
+                    });
+
+                    let mcp_config = readyset_adapter::mcp_http::McpHttpConfig {
+                        listen_addr: mcp_http_addr,
+                    };
+
+                    if let Err(e) = readyset_adapter::mcp_http::serve(
+                        mcp_authority,
+                        mcp_server,
+                        mcp_config,
+                        cancel,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "MCP HTTP server exited with error");
+                    }
+                }))
+            } else {
+                None
+            };
 
         while let Some(Ok(s)) = rt.block_on(listener.next()) {
             let client_addr = s.peer_addr()?;
