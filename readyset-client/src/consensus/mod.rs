@@ -21,9 +21,11 @@ use tracing::error;
 use url::Url;
 
 mod local;
+pub mod mcp_tokens;
 mod standalone;
 
 pub use self::local::{LocalAuthority, LocalAuthorityStore};
+pub use self::mcp_tokens::{McpToken, McpTokenScope, McpTokenStore};
 pub use self::standalone::StandaloneAuthority;
 use crate::debug::stats::PersistentStats;
 use crate::ControllerDescriptor;

@@ -15,12 +15,14 @@ categories = ["api-bindings", "database"]
 antithesis_sdk = { workspace = true }
 anyhow = { workspace = true }
 async-bincode = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive", "env"] }
 fail = { workspace = true }
 hyper = { workspace = true, features = ["stream", "client", "http2", "tcp", "runtime"] }
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 rmp-serde = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 bincode = { workspace = true }
