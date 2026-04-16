@@ -57,7 +57,7 @@ SELECT min(`table_1`.`column_4`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`c
 -1361583487
 
 # REA-6472
-query  rowsort error: The\ number\ of\ values\ returned\ does\ not\ match
+query  rowsort
 SELECT DISTINCT min(`table_1`.`column_5`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_3` > ?)
 ? = 10
 ----
@@ -123,7 +123,7 @@ SELECT min(`table_1`.`column_4`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`c
 -1361583487
 
 # REA-6472
-query  rowsort error: The\ number\ of\ values\ returned\ does\ not\ match
+query  rowsort
 SELECT DISTINCT min(`table_1`.`column_5`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_3` > ?)
 ? = 10
 ----

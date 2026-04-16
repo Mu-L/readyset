@@ -49,15 +49,13 @@ SELECT DISTINCT `table_1`.`column_1` AS `alias_1` FROM `table_1` WHERE (`table_1
 319860730
 414840755
 
-# REA-6472
 query  rowsort error: ERROR\ HY000\ \(1105\):\ Error\ during\ RPC\ \(extend_recipe\):\ SQL\ SELECT\ query\ 'q_[a-f0-9]+'\ couldn't\ be\ added:\ Operation\ unsupported:\ SUM\(DISTINCT\ \.\.\.\)\ is\ not\ supported\ as\ a\ post\-lookup\ aggregate
 SELECT sum(distinct `table_1`.`column_4`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_2` > ?)
 ? = 10
 ----
 431622957
 
-# REA-6472
-query  rowsort error: The\ number\ of\ values\ returned\ does\ not\ match
+query  rowsort error: SUM\(DISTINCT \.\.\.\) is not supported as a post-lookup aggregate
 SELECT DISTINCT sum(distinct `table_1`.`column_5`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_2` > ?)
 ? = 10
 ----
@@ -116,15 +114,13 @@ SELECT DISTINCT `table_1`.`column_1` AS `alias_1` FROM `table_1` WHERE (`table_1
 1112325198
 319860730
 
-# REA-6472
 query  rowsort error: ERROR\ HY000\ \(1105\):\ Error\ during\ RPC\ \(extend_recipe\):\ SQL\ SELECT\ query\ 'q_[a-f0-9]+'\ couldn't\ be\ added:\ Operation\ unsupported:\ SUM\(DISTINCT\ \.\.\.\)\ is\ not\ supported\ as\ a\ post\-lookup\ aggregate
 SELECT sum(distinct `table_1`.`column_4`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_2` > ?)
 ? = 10
 ----
 959112116
 
-# REA-6472
-query  rowsort error: The\ number\ of\ values\ returned\ does\ not\ match
+query  rowsort error: SUM\(DISTINCT \.\.\.\) is not supported as a post-lookup aggregate
 SELECT DISTINCT sum(distinct `table_1`.`column_5`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_2` > ?)
 ? = 10
 ----

@@ -62,7 +62,7 @@ SELECT max(`table_1`.`column_4`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`c
 2000782777
 
 # REA-6472
-query  rowsort error: The\ number\ of\ values\ returned\ does\ not\ match
+query  rowsort
 SELECT DISTINCT max(`table_1`.`column_5`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_1` > ?)
 ? = 10
 ----
@@ -128,7 +128,7 @@ SELECT max(`table_1`.`column_4`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`c
 1791028114
 
 # REA-6472
-query  rowsort error: The\ number\ of\ values\ returned\ does\ not\ match
+query  rowsort
 SELECT DISTINCT max(`table_1`.`column_5`) AS `alias_1` FROM `table_1` WHERE (`table_1`.`column_1` > ?)
 ? = 10
 ----
