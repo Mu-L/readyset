@@ -87,6 +87,9 @@ use futures::future::{self, OptionFuture};
 use lru::LruCache;
 use mysql_common::row::convert::{FromRow, FromRowError};
 use readyset_adapter_types::{DeallocateId, ParsedCommand, PreparedStatementType};
+use readyset_client::consensus::mcp_tokens::{
+    McpToken, McpTokenScope as AuthorityMcpTokenScope, McpTokenStore,
+};
 use readyset_client::consensus::{Authority, AuthorityControl, CacheDDLRequest};
 use readyset_client::recipe::CacheExpr;
 use readyset_client::results::Results;
@@ -103,11 +106,13 @@ use readyset_errors::{ReadySetResult, internal, internal_err, unsupported, unsup
 use readyset_schema::{ReadysetSchema, ReadysetSchemaSession};
 use readyset_shallow::{CacheInfo, CacheInsertGuard, CacheManager, CacheResult};
 use readyset_sql::ast::{
-    self, AlterReadysetStatement, CacheInner, CacheType, ChangeCdcStatement,
-    ChangeUpstreamStatement, CreateCacheOptions, CreateCacheStatement, DeallocateStatement,
-    DropAllCachesStatement, DropCacheStatement, ExplainStatement, FlushCacheStatement,
-    ProxiedQueriesOptions, ReadysetHintDirective, Relation, SelectStatement, SetStatement,
-    ShallowCacheQuery, ShowStatement, SqlIdentifier, SqlQuery, StatementIdentifier, UseStatement,
+    self, AlterMcpTokenStatement, AlterReadysetStatement, CacheInner, CacheType,
+    ChangeCdcStatement, ChangeUpstreamStatement, CreateCacheOptions, CreateCacheStatement,
+    CreateMcpTokenStatement, DeallocateStatement, DropAllCachesStatement, DropCacheStatement,
+    DropMcpTokenStatement, ExplainStatement, FlushCacheStatement, McpTokenExpiresChange,
+    McpTokenScope as ParserMcpTokenScope, ProxiedQueriesOptions, ReadysetHintDirective, Relation,
+    SelectStatement, SetStatement, ShallowCacheQuery, ShowStatement, SqlIdentifier, SqlQuery,
+    StatementIdentifier, UseStatement,
 };
 use readyset_sql::{Dialect, DialectDisplay};
 use readyset_sql_parsing::ParsingPreset;
@@ -3979,6 +3984,147 @@ where
         ))
     }
 
+    /// Parse an RFC 3339 EXPIRES timestamp and normalize it to UTC.
+    fn parse_expires_rfc3339(s: &str) -> ReadySetResult<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| internal_err!("invalid EXPIRES timestamp: {e}"))
+    }
+
+    /// Handle `CREATE MCP TOKEN '<name>' [WITH SCOPE <scope>] [EXPIRES '<datetime>']`.
+    ///
+    /// Generates a fresh random token value, stores its hash in the Authority,
+    /// and returns the raw value in a single-row result. This is the only time the
+    /// raw value is exposed.
+    async fn create_mcp_token(
+        state: &mut BackendState<DB>,
+        stmt: &CreateMcpTokenStatement,
+    ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
+        use rand::Rng;
+        use rand::distr::Alphanumeric;
+
+        let scope = match stmt.scope.as_ref() {
+            None | Some(ParserMcpTokenScope::ReadOnly) => AuthorityMcpTokenScope::ReadOnly,
+            Some(ParserMcpTokenScope::CacheAdmin) => AuthorityMcpTokenScope::CacheAdmin,
+            Some(ParserMcpTokenScope::Full) => AuthorityMcpTokenScope::Full,
+        };
+
+        let expires_at = stmt
+            .expires
+            .as_deref()
+            .map(Self::parse_expires_rfc3339)
+            .transpose()?;
+
+        let secret: String = rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
+        let value = format!("rs_mcp_{secret}");
+
+        let token = McpToken {
+            name: stmt.name.clone(),
+            hash: McpToken::hash_value(&value),
+            scope,
+            created_at: chrono::Utc::now(),
+            expires_at,
+        };
+        state.authority.add_mcp_token(token).await?;
+
+        let schema = SelectSchema {
+            schema: Cow::Owned(vec![ColumnSchema {
+                column: ast::Column {
+                    name: "token".into(),
+                    table: None,
+                },
+                column_type: DfType::DEFAULT_TEXT,
+                base: None,
+            }]),
+            columns: Cow::Owned(vec!["token".into()]),
+        };
+        let rows = vec![vec![DfValue::from(value)]];
+        Ok(noria_connector::QueryResult::from_owned(
+            schema,
+            vec![Results::new(rows)],
+        ))
+    }
+
+    /// Handle `DROP MCP TOKEN '<name>'`.
+    async fn drop_mcp_token(
+        state: &mut BackendState<DB>,
+        stmt: &DropMcpTokenStatement,
+    ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
+        state.authority.remove_mcp_token(&stmt.name).await?;
+        Ok(noria_connector::QueryResult::Delete {
+            num_rows_deleted: 1,
+        })
+    }
+
+    /// Handle `ALTER MCP TOKEN '<name>' SET (EXPIRES '<datetime>' | NEVER EXPIRES)`.
+    async fn alter_mcp_token(
+        state: &mut BackendState<DB>,
+        stmt: &AlterMcpTokenStatement,
+    ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
+        let expires_at = match &stmt.expires {
+            McpTokenExpiresChange::Never => None,
+            McpTokenExpiresChange::At(s) => Some(Self::parse_expires_rfc3339(s)?),
+        };
+        state
+            .authority
+            .set_mcp_token_expires_at(&stmt.name, expires_at)
+            .await?;
+        Ok(noria_connector::QueryResult::Empty)
+    }
+
+    /// Handle `SHOW MCP TOKENS`.
+    async fn show_mcp_tokens(
+        state: &BackendState<DB>,
+    ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
+        let tokens = state.authority.mcp_tokens().await?;
+
+        let col = |name: &str| ColumnSchema {
+            column: ast::Column {
+                name: name.into(),
+                table: None,
+            },
+            column_type: DfType::DEFAULT_TEXT,
+            base: None,
+        };
+        let schema = SelectSchema {
+            schema: Cow::Owned(vec![
+                col("name"),
+                col("scope"),
+                col("created_at"),
+                col("expires_at"),
+            ]),
+            columns: Cow::Owned(vec![
+                "name".into(),
+                "scope".into(),
+                "created_at".into(),
+                "expires_at".into(),
+            ]),
+        };
+
+        let rows: Vec<Vec<DfValue>> = tokens
+            .into_iter()
+            .map(|t| {
+                vec![
+                    DfValue::from(t.name),
+                    DfValue::from(t.scope.to_string()),
+                    DfValue::from(t.created_at.to_rfc3339()),
+                    t.expires_at
+                        .map(|e| DfValue::from(e.to_rfc3339()))
+                        .unwrap_or(DfValue::None),
+                ]
+            })
+            .collect();
+
+        Ok(noria_connector::QueryResult::from_owned(
+            schema,
+            vec![Results::new(rows)],
+        ))
+    }
+
     async fn query_readyset_extensions<'a>(
         connectors: &'a mut BackendConnectors<DB>,
         settings: &'a BackendSettings,
@@ -4351,6 +4497,10 @@ where
             SqlQuery::DropRls(_drop_rls) => {
                 unsupported!("DROP RLS statement is not yet supported")
             }
+            SqlQuery::CreateMcpToken(stmt) => Self::create_mcp_token(state, stmt).await,
+            SqlQuery::DropMcpToken(stmt) => Self::drop_mcp_token(state, stmt).await,
+            SqlQuery::AlterMcpToken(stmt) => Self::alter_mcp_token(state, stmt).await,
+            SqlQuery::Show(ShowStatement::McpTokens) => Self::show_mcp_tokens(state).await,
             _ => Err(internal_err!("Provided query is not a Readyset extension")),
         };
 
