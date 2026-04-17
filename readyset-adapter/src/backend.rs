@@ -3016,19 +3016,9 @@ where
         }
     }
 
-    fn make_name_and_id(
-        name: &mut Option<Relation>,
-        query_id: QueryId,
-    ) -> (QueryId, &Relation, Option<Relation>) {
-        let requested_name = name.clone();
-        let name = match name {
-            Some(name) => &*name,
-            None => {
-                *name = Some(query_id.into());
-                name.as_ref().unwrap()
-            }
-        };
-        (query_id, name, requested_name)
+    fn resolve_id_and_name(name: Option<Relation>, query_id: QueryId) -> (QueryId, Relation) {
+        let name = name.unwrap_or_else(|| query_id.into());
+        (query_id, name)
     }
 
     /// Forwards a `CREATE CACHE` request to ReadySet
@@ -3037,25 +3027,17 @@ where
         connectors: &mut BackendConnectors<DB>,
         settings: &BackendSettings,
         state: &mut BackendState<DB>,
-        name: &mut Option<Relation>,
-        deep: ReadySetResult<ViewCreateRequest>,
+        name: Relation,
+        query_id: QueryId,
+        deep: ViewCreateRequest,
         shallow: ReadySetResult<ShallowViewRequest>,
         always: bool,
         concurrently: bool,
         schema_generation: SchemaGeneration,
     ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
-        let deep = deep?;
-        let (query_id, name, requested_name) = Self::make_name_and_id(name, QueryId::from(&deep));
-
         // If we have existing caches with the same query_id or name, drop them first.
-        Self::drop_caches_on_collision(
-            connectors,
-            settings,
-            state,
-            Some(query_id),
-            requested_name.as_ref(),
-        )
-        .await?;
+        Self::drop_caches_on_collision(connectors, settings, state, Some(query_id), Some(&name))
+            .await?;
         if let Ok(shallow) = shallow {
             Self::drop_caches_on_collision(
                 connectors,
@@ -3071,7 +3053,7 @@ where
         let migration_state = match connectors
             .noria
             .handle_create_cached_query(
-                Some(name),
+                Some(&name),
                 deep.clone(),
                 always,
                 concurrently,
@@ -3120,7 +3102,7 @@ where
         connectors: &mut BackendConnectors<DB>,
         settings: &BackendSettings,
         state: &mut BackendState<DB>,
-        mut name: Option<Relation>,
+        name: Option<Relation>,
         deep: ReadySetResult<ViewCreateRequest>,
         shallow: ReadySetResult<ShallowViewRequest>,
         always: bool,
@@ -3129,6 +3111,9 @@ where
         ddl_req: Option<CacheDDLRequest>,
         quiet: bool,
     ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
+        let deep = deep?;
+        let (query_id, name) = Self::resolve_id_and_name(name, QueryId::from(&deep));
+
         if let Some(ref ddl_req) = ddl_req {
             state
                 .authority
@@ -3140,7 +3125,8 @@ where
             connectors,
             settings,
             state,
-            &mut name,
+            name.clone(),
+            query_id,
             deep,
             shallow,
             always,
@@ -3153,7 +3139,7 @@ where
             &res,
             &state.authority,
             ddl_req,
-            name,
+            Some(name),
             "deep",
             |auth, req| async move { auth.remove_cache_ddl_request(req).await },
             quiet,
@@ -3168,7 +3154,7 @@ where
         connectors: &mut BackendConnectors<DB>,
         settings: &BackendSettings,
         state: &mut BackendState<DB>,
-        mut name: Option<Relation>,
+        name: Option<Relation>,
         deep: ReadySetResult<ViewCreateRequest>,
         shallow: ReadySetResult<ShallowViewRequest>,
         policy: Option<ast::EvictionPolicy>,
@@ -3185,16 +3171,9 @@ where
         }
 
         // DDL-specific: drop collisions before creating.
-        let (query_id, _, requested_name) =
-            Self::make_name_and_id(&mut name, QueryId::from(&shallow));
-        Self::drop_caches_on_collision(
-            connectors,
-            settings,
-            state,
-            Some(query_id),
-            requested_name.as_ref(),
-        )
-        .await?;
+        let (query_id, name) = Self::resolve_id_and_name(name, QueryId::from(&shallow));
+        Self::drop_caches_on_collision(connectors, settings, state, Some(query_id), Some(&name))
+            .await?;
         if let Ok(deep) = deep {
             Self::drop_caches_on_collision(
                 connectors,
@@ -3212,13 +3191,13 @@ where
         match Self::create_shallow_cache_core(
             settings,
             state,
+            query_id,
             name,
             &shallow,
             policy,
             always,
             coalesce_ms,
             ddl_req,
-            requested_name,
             false,
         )
         .await
@@ -3236,13 +3215,13 @@ where
     async fn create_shallow_cache_core(
         settings: &BackendSettings,
         state: &BackendState<DB>,
-        mut name: Option<Relation>,
+        query_id: QueryId,
+        name: Relation,
         shallow: &ShallowViewRequest,
         policy: Option<ast::EvictionPolicy>,
         always: bool,
         coalesce_ms: Option<Duration>,
         ddl_req: CacheDDLRequest,
-        requested_name: Option<Relation>,
         quiet: bool,
     ) -> ReadySetResult<()> {
         state
@@ -3250,11 +3229,8 @@ where
             .add_shallow_cache_ddl_request(ddl_req.clone())
             .await?;
 
-        let (query_id, cache_name, _) = Self::make_name_and_id(&mut name, QueryId::from(shallow));
-        let cache_name = cache_name.clone();
-
         let res = state.shallow.create_cache(
-            Some(cache_name),
+            Some(name.clone()),
             Some(query_id),
             shallow.query.clone(),
             shallow.schema_search_path.clone(),
@@ -3283,7 +3259,7 @@ where
                     &res,
                     &state.authority,
                     Some(ddl_req),
-                    requested_name,
+                    Some(name),
                     "shallow",
                     |auth, req| async move { auth.remove_shallow_cache_ddl_request(req).await },
                     quiet,
@@ -4442,6 +4418,7 @@ where
             return None;
         }
 
+        let (query_id, name) = Self::resolve_id_and_name(None, QueryId::from(shallow));
         let query_text = shallow.query.display(DB::SQL_DIALECT).to_string();
         let ddl_stmt = build_hint_ddl_string(DB::SQL_DIALECT, &opts, &query_text);
         let ddl_req = CacheDDLRequest {
@@ -4453,13 +4430,13 @@ where
         match Self::create_shallow_cache_core(
             settings,
             state,
-            None,
+            query_id,
+            name,
             shallow,
             opts.policy,
             opts.always,
             opts.coalesce_ms,
             ddl_req,
-            None,
             true,
         )
         .await
