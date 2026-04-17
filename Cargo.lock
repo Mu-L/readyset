@@ -6225,6 +6225,7 @@ dependencies = [
 name = "readyset-e2e-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "assert_matches",
  "chrono",
  "database-utils",
@@ -6240,21 +6241,28 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "readyset-adapter",
+ "readyset-client",
  "readyset-client-metrics",
  "readyset-client-test-helpers",
+ "readyset-mcp",
+ "readyset-schema",
  "readyset-server",
+ "readyset-shallow",
  "readyset-sql",
  "readyset-sql-parsing",
  "readyset-tracing",
  "readyset-util",
  "replication-offset",
+ "reqwest 0.13.1",
  "rsa",
  "schema-catalog",
+ "serde_json",
  "test-discovery",
  "test-strategy",
  "test-utils",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
 ]
 
 [[package]]
