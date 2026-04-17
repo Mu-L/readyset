@@ -3016,6 +3016,33 @@ where
         }
     }
 
+    /// Build the single-row result returned by a successful `CREATE CACHE`.
+    fn create_cache_result(
+        query_id: QueryId,
+        name: &Relation,
+        query: String,
+        cache_type: CacheType,
+    ) -> noria_connector::QueryResult<'static> {
+        noria_connector::QueryResult::Meta(vec![
+            MetaVariable {
+                name: "query_id".into(),
+                value: query_id.to_string(),
+            },
+            MetaVariable {
+                name: "name".into(),
+                value: name.display_unquoted().to_string(),
+            },
+            MetaVariable {
+                name: "query".into(),
+                value: query,
+            },
+            MetaVariable {
+                name: "cache_type".into(),
+                value: cache_type.to_string(),
+            },
+        ])
+    }
+
     fn resolve_id_and_name(name: Option<Relation>, query_id: QueryId) -> (QueryId, Relation) {
         let name = name.unwrap_or_else(|| query_id.into());
         (query_id, name)
@@ -3094,7 +3121,13 @@ where
         state
             .query_status_cache
             .always_attempt_readyset(&deep, always);
-        Ok(noria_connector::QueryResult::Empty)
+        let query = Self::format_query_text(deep.statement.display(DB::SQL_DIALECT).to_string());
+        Ok(Self::create_cache_result(
+            query_id,
+            &name,
+            query,
+            CacheType::Deep,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3192,7 +3225,7 @@ where
             settings,
             state,
             query_id,
-            name,
+            name.clone(),
             &shallow,
             policy,
             always,
@@ -3203,7 +3236,14 @@ where
         .await
         {
             Ok(()) | Err(ReadySetError::ViewAlreadyExists(_)) => {
-                Ok(noria_connector::QueryResult::Empty)
+                let query =
+                    Self::format_query_text(shallow.query.display(DB::SQL_DIALECT).to_string());
+                Ok(Self::create_cache_result(
+                    query_id,
+                    &name,
+                    query,
+                    CacheType::Shallow,
+                ))
             }
             Err(e) => Err(e),
         }
