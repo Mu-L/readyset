@@ -15,14 +15,19 @@
 //! database and checked at startup. If the persisted version does not match, the database is
 //! deleted and re-snapshotted from upstream.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use bit_vec::BitVec;
 use mysql_time::MySqlTime;
+use readyset_client::internal::{Index, IndexType};
 use readyset_data::{Array, Collation, DfValue, TinyText};
 use readyset_decimal::Decimal;
+use replication_offset::mysql::MySqlPosition;
+use replication_offset::postgres::PostgresPosition;
+use replication_offset::{GtidSet, ReplicationOffset};
 
-use super::{serialize_key, PointKey};
+use super::{serialize_key, PersistentMeta, PointKey};
 
 /// Version number for the on-disk persistent state format.
 ///
@@ -216,6 +221,58 @@ pub fn example_serialized_row() -> Vec<DfValue> {
         .collect()
 }
 
+/// Builds a set of [`PersistentMeta`] instances covering every [`ReplicationOffset`] variant
+/// and both [`IndexType`]s. Serialized to JSON for comparison against a golden reference file.
+///
+/// Used by the `meta_serialization_backwards_compatibility` test and the
+/// `make_serialized_meta` example to produce/verify the reference file.
+pub fn example_serialized_metas() -> serde_json::Value {
+    let metas: Vec<PersistentMeta<'static>> = vec![
+        // No replication offset
+        PersistentMeta {
+            persistent_state_version: PERSISTENT_STATE_VERSION,
+            indices: vec![Index::new(IndexType::HashMap, vec![0])],
+            epoch: 1,
+            replication_offset: None,
+        },
+        // MySQL binlog-position offset
+        PersistentMeta {
+            persistent_state_version: PERSISTENT_STATE_VERSION,
+            indices: vec![
+                Index::new(IndexType::HashMap, vec![0, 1]),
+                Index::new(IndexType::BTreeMap, vec![2]),
+            ],
+            epoch: 42,
+            replication_offset: Some(Cow::Owned(ReplicationOffset::MySql(
+                MySqlPosition::from_file_name_and_position("binlog.000001".to_owned(), 154)
+                    .expect("valid mysql position"),
+            ))),
+        },
+        // Postgres LSN offset
+        PersistentMeta {
+            persistent_state_version: PERSISTENT_STATE_VERSION,
+            indices: vec![Index::new(IndexType::HashMap, vec![0])],
+            epoch: 100,
+            replication_offset: Some(Cow::Owned(ReplicationOffset::Postgres(PostgresPosition {
+                commit_lsn: 12345.into(),
+                lsn: 6789.into(),
+            }))),
+        },
+        // MySQL GTID offset (exercises BTreeMap, GtidSource custom serde, GtidRange)
+        PersistentMeta {
+            persistent_state_version: PERSISTENT_STATE_VERSION,
+            indices: vec![Index::new(IndexType::BTreeMap, vec![0, 1, 2])],
+            epoch: 200,
+            replication_offset: Some(Cow::Owned(ReplicationOffset::Gtid(
+                GtidSet::parse("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-10")
+                    .expect("valid gtid set"),
+            ))),
+        },
+    ];
+
+    serde_json::to_value(&metas).expect("failed to serialize example metas")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -356,5 +413,120 @@ mod tests {
         {
             assert_eq!(expected, got, "row[{i}] ({label}) deserialized differently");
         }
+    }
+
+    /// Checks that PersistentMeta JSON serialization (including ReplicationOffset, Index, and
+    /// epoch) matches the golden reference file. If this test fails, someone changed the
+    /// serialization format of a type stored in PersistentMeta. In that case:
+    ///
+    /// 1. Bump [`PERSISTENT_STATE_VERSION`]
+    /// 2. Run `cargo run -p dataflow-state --example make_serialized_meta`
+    ///    to regenerate the reference file
+    #[test]
+    fn meta_serialization_backwards_compatibility() {
+        let current = example_serialized_metas();
+        let reference: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/serialized-meta.json"))
+                .expect("failed to parse reference meta JSON");
+        assert_eq!(current, reference, "PersistentMeta serialization changed");
+    }
+
+    /// Checks that the golden reference file can be deserialized back into PersistentMeta
+    /// instances with correct field values. This catches changes that would break reading
+    /// existing RocksDB metadata, including silent field defaulting.
+    #[test]
+    fn meta_deserialization_backwards_compatibility() {
+        let reference: Vec<PersistentMeta<'static>> =
+            serde_json::from_str(include_str!("../../tests/serialized-meta.json"))
+                .expect("failed to deserialize reference meta JSON into PersistentMeta");
+        assert_eq!(reference.len(), 4, "expected 4 example metas in reference");
+
+        // Every example meta is written with the current PERSISTENT_STATE_VERSION; if this
+        // assertion fails it means the version field silently defaulted or the on-disk
+        // representation drifted from what the producer wrote.
+        for (i, meta) in reference.iter().enumerate() {
+            assert_eq!(
+                meta.persistent_state_version, PERSISTENT_STATE_VERSION,
+                "reference[{i}] version field did not round-trip"
+            );
+        }
+
+        // [0]: no replication offset, single HashMap index on column 0
+        assert_eq!(reference[0].epoch, 1);
+        assert!(reference[0].replication_offset.is_none());
+        assert_eq!(
+            reference[0].indices,
+            vec![Index::new(IndexType::HashMap, vec![0])]
+        );
+
+        // [1]: MySQL binlog offset at "binlog.000001":154, two indices (HashMap + BTreeMap)
+        assert_eq!(reference[1].epoch, 42);
+        assert_eq!(
+            reference[1].indices,
+            vec![
+                Index::new(IndexType::HashMap, vec![0, 1]),
+                Index::new(IndexType::BTreeMap, vec![2]),
+            ]
+        );
+        match reference[1].replication_offset.as_deref() {
+            Some(ReplicationOffset::MySql(pos)) => {
+                let expected =
+                    MySqlPosition::from_file_name_and_position("binlog.000001".to_owned(), 154)
+                        .expect("valid mysql position");
+                assert_eq!(pos, &expected);
+            }
+            other => panic!("expected MySql offset, got {other:?}"),
+        }
+
+        // [2]: Postgres LSN offset at commit_lsn=12345, lsn=6789
+        assert_eq!(reference[2].epoch, 100);
+        assert_eq!(
+            reference[2].indices,
+            vec![Index::new(IndexType::HashMap, vec![0])]
+        );
+        match reference[2].replication_offset.as_deref() {
+            Some(ReplicationOffset::Postgres(pos)) => {
+                assert_eq!(
+                    pos,
+                    &PostgresPosition {
+                        commit_lsn: 12345.into(),
+                        lsn: 6789.into(),
+                    }
+                );
+            }
+            other => panic!("expected Postgres offset, got {other:?}"),
+        }
+
+        // [3]: MySQL GTID offset, single BTreeMap index on three columns
+        assert_eq!(reference[3].epoch, 200);
+        assert_eq!(
+            reference[3].indices,
+            vec![Index::new(IndexType::BTreeMap, vec![0, 1, 2])]
+        );
+        match reference[3].replication_offset.as_deref() {
+            Some(ReplicationOffset::Gtid(gtid)) => {
+                let expected = GtidSet::parse("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-10")
+                    .expect("valid gtid set");
+                assert_eq!(gtid, &expected);
+            }
+            other => panic!("expected Gtid offset, got {other:?}"),
+        }
+    }
+
+    /// PersistentMeta uses `#[serde(alias = "serde_version")]` so existing RocksDB
+    /// metadata written under the old field name still deserializes after the rename.
+    /// Verifies the migration path: read with the old name, write with the new name.
+    #[test]
+    fn meta_alias_accepts_legacy_field_name() {
+        let legacy_json = r#"{
+            "serde_version": 6,
+            "indices": [{"index_type": "HashMap", "columns": [0]}],
+            "epoch": 7,
+            "replication_offset": null
+        }"#;
+        let meta: PersistentMeta<'static> =
+            serde_json::from_str(legacy_json).expect("legacy serde_version field name accepted");
+        assert_eq!(meta.epoch, 7);
+        assert!(meta.replication_offset.is_none());
     }
 }

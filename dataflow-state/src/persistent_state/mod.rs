@@ -112,7 +112,9 @@ use tracing::{debug, error, info, info_span, trace, warn};
 mod format_version;
 
 use format_version::PERSISTENT_STATE_VERSION;
-pub use format_version::{example_serialized_keys, example_serialized_row};
+pub use format_version::{
+    example_serialized_keys, example_serialized_metas, example_serialized_row,
+};
 
 use crate::persistent_state::metrics::{MetricsReporter, MetricsReporterStop};
 use crate::{
@@ -3554,6 +3556,79 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Opening a `PersistentState` against on-disk metadata written by an older binary
+    /// (lower [`PERSISTENT_STATE_VERSION`]) must:
+    ///   1. Surface [`Error::PersistentStateVersionMismatch`] from `new_inner`.
+    ///   2. Report the mismatch as *non*-permanent, so the outer [`PersistentState::new`]
+    ///      knows it can safely delete the directory and resnapshot from upstream.
+    ///   3. Recover transparently when called via the public `new` entry point — the
+    ///      tampered DB is wiped and a fresh one is created with the current version.
+    #[test]
+    fn persistent_state_version_mismatch_triggers_resnapshot() {
+        let (_dir, name) = get_tmp_path();
+        let params = PersistenceParameters {
+            mode: DurabilityMode::Permanent,
+            ..Default::default()
+        };
+
+        // Pre-create a minimal RocksDB at the target path with metadata pinned to an
+        // older version. This simulates on-disk state left by a prior incompatible
+        // binary without requiring a full PersistentState::new bootstrap.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = DB::open(&opts, &name).unwrap();
+            let stale = PersistentMeta {
+                persistent_state_version: PERSISTENT_STATE_VERSION - 1,
+                indices: Vec::new(),
+                epoch: 0,
+                replication_offset: None,
+            };
+            (&db).save_meta(&stale);
+        }
+
+        // Calling `new_inner` directly bypasses the auto-recovery loop in `new`, so we
+        // can observe the raw error.
+        let err = PersistentState::new_inner(
+            SqlIdentifier::from(name.clone()),
+            None,
+            PathBuf::from(&name),
+            Vec::<Box<[usize]>>::new(),
+            &params,
+            PersistenceType::BaseTable,
+            None,
+        )
+        .expect_err("new_inner should fail on version mismatch");
+        match &err {
+            Error::PersistentStateVersionMismatch {
+                persisted_version,
+                our_version,
+                ..
+            } => {
+                assert_eq!(*persisted_version, PERSISTENT_STATE_VERSION - 1);
+                assert_eq!(*our_version, PERSISTENT_STATE_VERSION);
+            }
+            other => panic!("expected PersistentStateVersionMismatch, got {other:?}"),
+        }
+        assert!(
+            !err.is_permanent(),
+            "version mismatch must be non-permanent so callers know to delete + resnapshot"
+        );
+
+        // The public entry point should recover transparently: the tampered directory is
+        // wiped and a fresh DB is created with the current version.
+        let recovered = PersistentState::new(
+            name,
+            None,
+            Vec::<Box<[usize]>>::new(),
+            &params,
+            PersistenceType::BaseTable,
+            None,
+        )
+        .expect("auto-recovery should succeed after version mismatch");
+        drop(recovered);
     }
 
     #[test]
