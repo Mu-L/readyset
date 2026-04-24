@@ -625,3 +625,216 @@ fn parse_unknown_duration_unit_fails() {
         parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE POLICY TTL 10 MINUTES");
     assert!(result.is_err(), "unknown unit should fail");
 }
+
+// --- PostgreSQL dialect parity tests ---
+//
+// These exercise the same hint scenarios as above on the PostgreSQL dialect.
+// The Readyset hint logic itself is dialect-agnostic; these tests verify that
+// the upstream PostgreSQL dialect advertises `supports_comment_optimizer_hint`,
+// without which `/*rs+ ... */` comments would be discarded before ever
+// reaching our hint parser.
+
+/// Parse `hinted` and `plain` on `dialect`, assert the plain query produces no
+/// directive, and assert the hint-stripped query equals the plain one (both
+/// structurally and via Display). Returns the hinted-side directive so the
+/// caller can assert on its shape.
+fn parse_and_assert_stripped(
+    dialect: Dialect,
+    hinted: &str,
+    plain: &str,
+) -> Option<ReadysetHintDirective> {
+    let (with_hint, directive) =
+        parse_shallow_query(dialect, hinted).expect("should parse hinted query");
+    let (without_hint, plain_directive) =
+        parse_shallow_query(dialect, plain).expect("should parse plain query");
+
+    assert!(
+        plain_directive.is_none(),
+        "plain query must produce no directive"
+    );
+    assert_eq!(
+        with_hint, without_hint,
+        "hint-stripped query must equal plain query"
+    );
+    assert_eq!(
+        format!("{with_hint}"),
+        format!("{without_hint}"),
+        "Display must be identical with and without hint"
+    );
+    directive
+}
+
+#[test]
+fn pg_create_cache_directive_extracted() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_skip_cache_directive_extracted() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ SKIP CACHE */ id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1",
+    );
+    assert_eq!(directive, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn pg_create_cache_with_ttl_policy() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE POLICY TTL 300 SECONDS REFRESH 60 SECONDS */ \
+         id FROM orders WHERE user_id = $1",
+        "SELECT id FROM orders WHERE user_id = $1",
+    );
+    let Some(ReadysetHintDirective::CreateCache(opts)) = directive else {
+        panic!("expected CreateCache directive");
+    };
+    assert_eq!(opts.cache_type, Some(CacheType::Shallow));
+    assert!(opts.policy.is_some());
+}
+
+#[test]
+fn pg_uppercase_hint_prefix_recognized() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*RS+ CREATE SHALLOW CACHE */ id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_non_rs_hint_also_stripped() {
+    // A non-rs hint (e.g. `pg_hint_plan`-style `/*pg+ SeqScan(t) */`) must be
+    // stripped from the query so it does not affect the hash, but no
+    // Readyset directive is returned.
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*pg+ SeqScan(t) */ id FROM t WHERE id = $1",
+        "SELECT id FROM t WHERE id = $1",
+    );
+    assert!(
+        directive.is_none(),
+        "non-rs hint must not produce a directive"
+    );
+}
+
+#[test]
+fn pg_mixed_rs_and_non_rs_hints_all_stripped() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*pg+ SeqScan(t) */ /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = $1",
+        "SELECT id FROM t WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_multiple_rs_hints_first_wins_all_stripped() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ /*rs+ INVALID */ id FROM t WHERE id = $1",
+        "SELECT id FROM t WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_create_cache_hint_in_union() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ 1 UNION SELECT 2",
+        "SELECT 1 UNION SELECT 2",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_skip_cache_hint_in_union() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ SKIP CACHE */ 1 UNION SELECT 2",
+        "SELECT 1 UNION SELECT 2",
+    );
+    assert_eq!(directive, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn pg_hint_on_right_side_of_union_stripped() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT 1 UNION SELECT /*rs+ CREATE SHALLOW CACHE */ 2",
+        "SELECT 1 UNION SELECT 2",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_malformed_hint_still_returns_valid_shallow_query() {
+    // Malformed hint text (`POLICY TT` instead of `POLICY TTL`) must not
+    // prevent the plain query from being returned, and must produce
+    // directive = None.
+    let (query, directive) = parse_shallow_query(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE POLICY TT 300 SECONDS */ id FROM t WHERE id = $1",
+    )
+    .expect("should parse despite malformed hint");
+    assert!(directive.is_none());
+
+    let (plain, _) =
+        parse_shallow_query(Dialect::PostgreSQL, "SELECT id FROM t WHERE id = $1")
+            .expect("should parse plain query");
+    assert_eq!(query, plain);
+}
+
+#[test]
+fn pg_create_cache_from_select_with_hint_stripped() {
+    let create_sql = "CREATE SHALLOW CACHE FROM \
+                      SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = $1";
+    let query = parse_query(Dialect::PostgreSQL, create_sql).expect("parse create cache");
+    let SqlQuery::CreateCache(stmt) = query else {
+        panic!("expected CreateCache")
+    };
+    let CacheInner::Statement {
+        shallow: Ok(shallow),
+        ..
+    } = stmt.inner
+    else {
+        panic!("expected shallow Ok")
+    };
+
+    let (via_parse_shallow, _) = parse_shallow_query(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = $1",
+    )
+    .expect("parse shallow");
+
+    assert_eq!(
+        *shallow, via_parse_shallow,
+        "CREATE CACHE path must produce the same hint-stripped ShallowCacheQuery as the query path"
+    );
+}

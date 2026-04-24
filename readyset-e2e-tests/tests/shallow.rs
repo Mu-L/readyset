@@ -1877,3 +1877,344 @@ async fn skip_cache_hint_bypasses_shallow_cache_prepared() {
 
     shutdown_tx.shutdown().await;
 }
+
+// --- PostgreSQL hint e2e tests ---
+//
+// These mirror the MySQL hint e2e tests above, exercising the
+// `/*rs+ CREATE SHALLOW CACHE */` and `/*rs+ SKIP CACHE */` directives
+// against the PostgreSQL adapter. The underlying hint logic is
+// dialect-agnostic, but upstream sqlparser only emits optimizer hints for
+// dialects that opt in via `supports_comment_optimizer_hint`; these tests
+// verify the PostgreSQL dialect does so.
+
+fn pg_first_col_i32(rows: &[SimpleQueryMessage], col: usize) -> i32 {
+    first_row_col(rows, col)
+        .parse::<i32>()
+        .expect("column should parse as i32")
+}
+
+/// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint creates a shallow cache
+/// on the PostgreSQL adapter and the next identical query hits the cache.
+#[test]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn pg_hint_creates_shallow_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name!();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    // First hinted query: creates the cache and returns from upstream.
+    let rows = rs
+        .simple_query("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .expect("first hinted query");
+    assert_eq!(pg_first_col_i32(&rows, 0), 1);
+    assert_eq!(pg_first_col_i32(&rows, 1), 100);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+
+    // Second query (same, with hint): should hit the shallow cache.
+    let rows = rs
+        .simple_query("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .expect("second hinted query");
+    assert_eq!(pg_first_col_i32(&rows, 0), 1);
+    assert_eq!(pg_first_col_i32(&rows, 1), 100);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    // Same query with no hint: same QueryId, should also hit the cache.
+    rs.simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("non-hinted query");
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that a hinted prepared statement creates a shallow cache on the
+/// PostgreSQL adapter via the extended protocol (prepare + execute path).
+#[test]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn pg_hint_prepared_statement_creates_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name!();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t5 (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t5 VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    let hinted_stmt = rs
+        .prepare("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t5 WHERE id = $1")
+        .await
+        .expect("prepare hinted");
+
+    // First execute: cache miss, goes to upstream (cache creation happens here).
+    let row = rs
+        .query_one(&hinted_stmt, &[&1i32])
+        .await
+        .expect("first exec");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 10);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+
+    // Second execute: same prepared statement should hit the shallow cache.
+    let row = rs
+        .query_one(&hinted_stmt, &[&1i32])
+        .await
+        .expect("second exec");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 10);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    // A separately-prepared, non-hinted version of the same query should
+    // also hit the cache (same QueryId after hint stripping).
+    let plain_stmt = rs
+        .prepare("SELECT id, val FROM t5 WHERE id = $1")
+        .await
+        .expect("prepare plain");
+    let row = rs
+        .query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("plain exec");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 10);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `/*rs+ SKIP CACHE */` bypasses the shallow cache and routes
+/// to upstream on the PostgreSQL adapter (simple query protocol).
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pg_skip_cache_hint_bypasses_shallow_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name!();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    // Create a shallow cache via DDL, then populate it.
+    rs.simple_query("CREATE SHALLOW CACHE FROM SELECT id, val FROM t WHERE id = $1")
+        .await
+        .expect("create shallow cache");
+    rs.simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("populate cache");
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+    rs.simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("cache hit");
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    // Mutate upstream so we can tell SKIP CACHE read fresh data.
+    upstream
+        .simple_query("UPDATE t SET val = 999 WHERE id = 1")
+        .await
+        .expect("update upstream");
+
+    // SKIP CACHE hint: should bypass the shallow cache and go to upstream.
+    let rows = rs
+        .simple_query("SELECT /*rs+ SKIP CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .expect("skip cache query");
+    assert_eq!(pg_first_col_i32(&rows, 1), 999);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+
+    // Without the hint, the cache should still serve the stale value.
+    let rows = rs
+        .simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("cached query after SKIP");
+    assert_eq!(pg_first_col_i32(&rows, 1), 100);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `/*rs+ SKIP CACHE */` bypasses the shallow cache for prepared
+/// statements on the PostgreSQL adapter (extended protocol).
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pg_skip_cache_hint_bypasses_shallow_cache_prepared() {
+    init_test_logging();
+
+    let test_name = derive_test_name!();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    rs.simple_query("CREATE SHALLOW CACHE FROM SELECT id, val FROM t WHERE id = $1")
+        .await
+        .expect("create shallow cache");
+
+    let plain_stmt = rs
+        .prepare("SELECT id, val FROM t WHERE id = $1")
+        .await
+        .expect("prepare plain");
+
+    // Populate the shallow cache via two plain exec calls.
+    rs.query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("first exec");
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+    rs.query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("cache hit exec");
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    upstream
+        .simple_query("UPDATE t SET val = 999 WHERE id = 1")
+        .await
+        .expect("update upstream");
+
+    // Prepared exec with SKIP CACHE hint: should bypass and return fresh data.
+    let skip_stmt = rs
+        .prepare("SELECT /*rs+ SKIP CACHE */ id, val FROM t WHERE id = $1")
+        .await
+        .expect("prepare skip");
+    let row = rs
+        .query_one(&skip_stmt, &[&1i32])
+        .await
+        .expect("skip exec");
+    assert_eq!(row.get::<_, i32>(1), 999);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+
+    // Plain prepared exec still reads from the shallow cache.
+    let row = rs
+        .query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("plain exec after skip");
+    assert_eq!(row.get::<_, i32>(1), 100);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow,
+    );
+
+    shutdown_tx.shutdown().await;
+}
