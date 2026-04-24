@@ -20,6 +20,7 @@ mysql_async = { workspace = true }
 native-tls = { workspace = true }
 pem = { workspace = true }
 postgres-native-tls = { workspace = true }
+openssl = { version = "0.10", features = ["vendored"] }
 rmcp = { version = "1.4", features = ["server", "transport-io"] }
 schemars = "1"
 serde = { workspace = true, features = ["derive"] }

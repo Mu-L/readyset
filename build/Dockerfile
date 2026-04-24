@@ -28,6 +28,7 @@ RUN set -eux; \
         lld \
         llvm \
         mariadb-client \
+        musl-tools \
         postgresql-client \
         protobuf-compiler \
         rsync && \
