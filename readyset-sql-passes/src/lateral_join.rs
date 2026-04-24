@@ -3,12 +3,12 @@ use crate::rewrite_utils::{
     RewriteStatus, add_expression_to_join_constraint, align_group_by_and_windows_with_correlation,
     analyse_lone_aggregates_subquery_fields, and_predicates_skip_true, as_sub_query_with_alias,
     as_sub_query_with_alias_mut, collect_columns_in_expr_mut, collect_local_from_items,
-    collect_outermost_columns_mut, columns_iter, columns_iter_mut,
-    contain_subqueries_with_limit_clause, default_alias_for_select_item_expression,
-    expect_field_as_expr, expect_field_as_expr_mut, expect_sub_query_with_alias_mut,
-    extract_aggregate_fallback_for_expr, extract_correlation_keys, get_from_item_reference_name,
-    is_filter_pushable_from_item, move_correlated_constraints_from_join_to_where,
-    partition_correlated_predicates, project_columns_if,
+    columns_iter, columns_iter_mut, contain_subqueries_with_limit_clause,
+    default_alias_for_select_item_expression, expect_field_as_expr, expect_field_as_expr_mut,
+    expect_sub_query_with_alias_mut, extract_aggregate_fallback_for_expr, extract_correlation_keys,
+    get_from_item_reference_name, is_column_eq_column, is_filter_pushable_from_item,
+    move_correlated_constraints_from_join_to_where, outermost_expression_mut,
+    partition_correlated_predicates, project_columns_if, split_expr,
 };
 use crate::unnest_subqueries::{
     AggNoGbyCardinality, UnnestContext, agg_only_no_gby_cardinality, force_empty_select,
@@ -462,26 +462,90 @@ fn get_join_operator_for_lateral(
     Ok(InnerJoin)
 }
 
-/// Replace select-list columns with coalesced expressions from `fields_map`.
+/// Apply `fields_map` replacements to all `Expr::Column` nodes in `expr`.
+/// Returns the first `Err` from `fields_map` if any matched column's mapping is an error.
+fn apply_fields_map_to_expr(
+    expr: &mut Expr,
+    fields_map: &HashMap<Column, ReadySetResult<Expr>>,
+) -> ReadySetResult<()> {
+    for col_expr in collect_columns_in_expr_mut(expr) {
+        if let Expr::Column(col) = col_expr
+            && let Some(inl_expr) = fields_map.get(col)
+        {
+            match inl_expr {
+                Ok(inl_expr) => *col_expr = inl_expr.clone(),
+                Err(e) => return Err(e.clone()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check each top-level AND conjunct of a JOIN `ON` expression and reject if any conjunct
+/// is a cross-table `col_a = col_b` equality where one column is in `fields_map`; those are
+/// equi-join keys (§2.1 of known_core_limitations.md) that must stay as bare column references.
+/// Otherwise apply `fields_map` in-place.
+fn apply_or_reject_in_on_expr(
+    expr: &mut Expr,
+    fields_map: &HashMap<Column, ReadySetResult<Expr>>,
+) -> ReadySetResult<()> {
+    let mut conjuncts = Vec::new();
+    split_expr(&*expr, &|_| true, &mut conjuncts);
+    for conjunct in &conjuncts {
+        if is_column_eq_column(conjunct, |left_col, right_col| {
+            left_col.table.as_ref() != right_col.table.as_ref()
+                && (fields_map.contains_key(left_col) || fields_map.contains_key(right_col))
+        }) {
+            unsupported!(
+                "JOIN ON cross-table equality references a COUNT column requiring COALESCE mapping"
+            );
+        }
+    }
+    apply_fields_map_to_expr(expr, fields_map)
+}
+
+/// Replace column references from `fields_map` throughout the statement.
 ///
-/// Steps:
-/// 1. Alias any select-item to be replaced if it lacks an alias.
-/// 2. Move `stmt.fields` into a temporary `SelectStatement` to collect its outer columns.
-/// 3. Replace each collected column with the mapped `Expr`, returning on error.
-/// 4. Ensure no unmapped column references remain in `stmt`.
-/// 5. Restore updated fields back into `stmt.fields`.
+/// Background — why COALESCE is needed.  In the original LATERAL form
+/// `(SELECT COUNT(*) FROM t WHERE t.k = outer.k)`, the inner aggregate
+/// returns the SQL-standard value `0` for outer rows whose match set is
+/// empty (COUNT-over-empty = 0, never NULL).  Our pipeline rewrites this
+/// LATERAL into `LEFT JOIN (SELECT COUNT(*), k FROM t GROUP BY k) ON ...`
+/// — i.e. LEFT-JOIN-of-pre-grouped-subquery.  For outer rows whose group
+/// is absent from the pre-aggregation, LEFT JOIN propagates NULL into the
+/// COUNT column.  That NULL is an artifact of our rewrite, not of
+/// standard SQL semantics; left untreated it leaks into every position
+/// the column appears in (SELECT list, filters, ORDER BY, GROUP BY,
+/// single-relation JOIN ON conjuncts), where NULL changes which rows
+/// survive, how they're ordered, and how they group.  Wrapping the
+/// column with `COALESCE(col, 0)` in every such position restores the
+/// original 0-on-empty semantics the user wrote.
+///
+/// Applies COUNT→COALESCE mappings to:
+/// - SELECT list (with aliasing as needed)
+/// - WHERE, HAVING, ORDER BY, GROUP BY (scalar evaluation contexts —
+///   safe to wrap because they consume the column as a value)
+/// - JOIN ON single-relation filters (only one table referenced — no
+///   hash-join key shape issue)
+///
+/// Rejects JOIN ON cross-table equalities that reference a mapped column,
+/// because those are hash-join keys that must remain bare column
+/// references (§2.1 of known_core_limitations.md).
 ///
 /// # Arguments
 /// * `stmt` – mutable reference to the `SelectStatement`.
 /// * `fields_map` – map from `Column` to `Ok(coalesce_expr)` or `Err(ReadySetError)`.
 ///
 /// # Errors
-/// Returns the first `Err` from `fields_map`, or an `Unsupported` error if leftover columns exist.
+/// Returns the first `Err` from `fields_map`, or an `Unsupported` error for cross-table
+/// equality ON predicates that reference a mapped column.
 fn coalesce_fields_references(
     stmt: &mut SelectStatement,
     fields_map: &HashMap<Column, ReadySetResult<Expr>>,
 ) -> ReadySetResult<()> {
-    // 1: alias fields needing replacement
+    // 1: alias SELECT items that will be replaced where the replacement is a renamed column.
+    //    In practice fields_map always holds COALESCE expressions (not column renames), so this
+    //    loop is a no-op for the current callers. Kept as a safety guard for future reuse.
     for select_item in &mut stmt.fields {
         let (expr, maybe_alias) = expect_field_as_expr_mut(select_item);
         if maybe_alias.is_none()
@@ -492,35 +556,34 @@ fn coalesce_fields_references(
             *maybe_alias = Some(default_alias_for_select_item_expression(expr));
         }
     }
-    // 2: apply COALESCE replacements in SELECT fields only
-    for select_item in &mut stmt.fields {
-        let (expr, _) = expect_field_as_expr_mut(select_item);
-        for col_expr in collect_columns_in_expr_mut(expr) {
-            if let Expr::Column(col) = col_expr
-                && let Some(inl_expr) = fields_map.get(col)
-            {
-                match inl_expr {
-                    Ok(inl_expr) => {
-                        *col_expr = inl_expr.clone();
-                    }
-                    Err(e) => return Err(e.clone()),
-                }
-            }
+    // 2: handle JOIN ON first — walk conjuncts, reject cross-table equalities, apply elsewhere.
+    for join in &mut stmt.join {
+        if let JoinConstraint::On(on_expr) = &mut join.constraint {
+            apply_or_reject_in_on_expr(on_expr, fields_map)?;
         }
     }
-    // 3: error if mapped columns remain in non-field positions (WHERE, JOIN ON, etc.)
-    //    Temporarily take fields to exclude them from the outermost-columns check.
-    let saved_fields = mem::take(&mut stmt.fields);
-    let has_unmapped = collect_outermost_columns_mut(stmt)
-        .into_iter()
-        .any(|expr| matches!(expr, Expr::Column(col) if fields_map.get(col).is_some()));
-    stmt.fields = saved_fields;
-    if has_unmapped {
-        // TODO: think of a better error message
-        unsupported!("COALESCE function call in place of a column reference")
-    }
-
-    Ok(())
+    // 3: apply COALESCE to every remaining column reference (SELECT, WHERE, HAVING, ORDER BY,
+    //    GROUP BY). Temporarily take joins so outermost_expression_mut skips the ON expressions
+    //    we already rewrote — preventing double-wrapping.
+    //
+    // outermost_expression_mut does not descend into nested subqueries. This is sound because:
+    //
+    // a) WHERE/SELECT-list subqueries: unnest_subqueries_in_where and
+    //    unnest_subqueries_in_fields run before LATERAL inlining (see unnest_all_subqueries).
+    //    Any subquery referencing a LATERAL COUNT column was either already unnested (reference
+    //    is now at the outer scope) or rejected with Unsupported before we reach here.
+    //
+    // b) Downstream LATERAL bodies: a downstream LATERAL that references an upstream COUNT
+    //    column will have that reference hoisted to its JOIN ON as a cross-table equality
+    //    (e.g. lat2._corr = lat1.cnt), which is caught and rejected by step 2 above.
+    //    If the reference survives in the body SELECT, the downstream join's own ON condition
+    //    is `lat2._corr = lat1.cnt = NULL` for no-match rows, so the body result is never
+    //    observed — LEFT JOIN NULL-propagation makes the missing COALESCE irrelevant.
+    let saved_joins = mem::take(&mut stmt.join);
+    let result = outermost_expression_mut(stmt)
+        .try_for_each(|expr| apply_fields_map_to_expr(expr, fields_map));
+    stmt.join = saved_joins;
+    result
 }
 
 /// Identifies which single RHS table in a JoinClause is referenced
@@ -588,9 +651,9 @@ fn resolve_lateral_subqueries(
     // Rationale:
     //   After correlation hoist + grouping by local keys, an **absent key** yields **no RHS row**.
     //   For COUNT, the original scalar over empty input is **0** (not NULL); using
-    //   `coalesce_fields_references(..)` replaces outer SELECT‑list occurrences of that COUNT column
-    //   with `COALESCE(col, 0)` so projections match original semantics. We **never** apply these
-    //   mappings in WHERE/ORDER/GROUP BY—only in the outer SELECT list—to avoid changing filtering/ordering.
+    //   `coalesce_fields_references(..)` replaces occurrences of that COUNT column with
+    //   `COALESCE(col, 0)` in SELECT, WHERE, HAVING, ORDER BY, GROUP BY, and single-relation
+    //   JOIN ON conjuncts. Cross-table equality ON predicates are rejected (§2.1).
     //
     // Non‑goals / exclusions:
     //   • **AtMostOne** (HAVING present): we do **not** populate this map—projections should remain NULL when
@@ -834,9 +897,9 @@ fn resolve_lateral_subqueries(
         stmt.where_clause = and_predicates_skip_true(stmt.where_clause.take(), to_where);
     }
 
-    // Apply COUNT‑only COALESCE mappings to the **outer SELECT list** (if any were populated by
-    // `get_join_operator_for_lateral` for the CROSS/ON TRUE + ExactlyOne case). This step is
-    // projection‑only; WHERE/ORDER are intentionally unaffected.
+    // Apply COUNT→COALESCE mappings throughout the statement (SELECT, WHERE, HAVING,
+    // ORDER BY, GROUP BY, single-relation JOIN ON conjuncts).  Cross-table equality
+    // ON predicates are rejected (cannot be hash-join keys).
     if !coalesce_fields_map.is_empty() {
         coalesce_fields_references(stmt, &coalesce_fields_map)?;
     }
@@ -1561,6 +1624,89 @@ FROM
         // Join condition references a column that would require COALESCE mapping => unsupported.
         let expected_text = r#""#;
         test_it("test30", original_text, expected_text);
+    }
+
+    // COALESCE relaxation: COUNT column referenced in WHERE — COALESCE is applied there too.
+    // After LEFT JOIN inlining, l.cnt is NULL for no-match rows; COALESCE restores the original 0.
+    #[test]
+    fn test31() {
+        let original_text = r#"
+        SELECT a.k, l.cnt
+        FROM qa.a AS a
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS cnt
+            FROM qa.b AS b
+            WHERE b.k = a.k
+        ) AS l
+        WHERE l.cnt > 2
+        "#;
+        let expected_text = r#"SELECT "a"."k", coalesce("l"."cnt", 0)
+        FROM "qa"."a" AS "a" LEFT OUTER JOIN
+        (SELECT count(*) AS "cnt", "b"."k" AS "k" FROM "qa"."b" AS "b" GROUP BY "b"."k") AS "l"
+        ON ("l"."k" = "a"."k")
+        WHERE (coalesce("l"."cnt", 0) > 2)"#;
+        test_it("test31", original_text, expected_text);
+    }
+
+    // COALESCE relaxation: COUNT column in ORDER BY — COALESCE is applied there too.
+    #[test]
+    fn test32() {
+        let original_text = r#"
+        SELECT a.k, l.cnt
+        FROM qa.a AS a
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS cnt
+            FROM qa.b AS b
+            WHERE b.k = a.k
+        ) AS l
+        ORDER BY l.cnt DESC
+        "#;
+        let expected_text = r#"SELECT "a"."k", coalesce("l"."cnt", 0)
+        FROM "qa"."a" AS "a" LEFT OUTER JOIN
+        (SELECT count(*) AS "cnt", "b"."k" AS "k" FROM "qa"."b" AS "b" GROUP BY "b"."k") AS "l"
+        ON ("l"."k" = "a"."k")
+        ORDER BY coalesce("l"."cnt", 0) DESC NULLS FIRST"#;
+        test_it("test32", original_text, expected_text);
+    }
+
+    // COALESCE relaxation: COUNT column in a JOIN ON single-relation filter conjunct gets
+    // COALESCE; the cross-table equality conjunct on a non-mapped column is left as-is.
+    #[test]
+    fn test33() {
+        let original_text = r#"
+        SELECT a.k, l.cnt
+        FROM qa.a AS a
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS cnt
+            FROM qa.b AS b
+            WHERE b.k = a.k
+        ) AS l
+        JOIN qa.c AS c ON c.k = a.k AND l.cnt > 0
+        "#;
+        let expected_text = r#"SELECT "a"."k", coalesce("l"."cnt", 0)
+        FROM "qa"."a" AS "a" LEFT OUTER JOIN
+        (SELECT count(*) AS "cnt", "b"."k" AS "k" FROM "qa"."b" AS "b" GROUP BY "b"."k") AS "l"
+        ON ("l"."k" = "a"."k")
+        JOIN "qa"."c" AS "c" ON (("c"."k" = "a"."k") AND (coalesce("l"."cnt", 0) > 0))"#;
+        test_it("test33", original_text, expected_text);
+    }
+
+    // Negative: another JOIN's ON has a cross-table equality over the COUNT column.
+    // Cannot wrap a hash-join key in COALESCE (§2.1) — must remain unsupported.
+    #[test]
+    fn test34() {
+        let original_text = r#"
+        SELECT a.k, l.cnt
+        FROM qa.a AS a
+        CROSS JOIN LATERAL (
+            SELECT COUNT(*) AS cnt
+            FROM qa.b AS b
+            WHERE b.k = a.k
+        ) AS l
+        JOIN qa.c AS c ON c.threshold = l.cnt
+        "#;
+        let expected_text = r#""#;
+        test_it("test34", original_text, expected_text);
     }
 
     /// Nested LATERAL: inner INNER JOIN correlates with grandparent scope.
