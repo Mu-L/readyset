@@ -34,9 +34,12 @@ impl TryFromDialect<sqlparser::ast::Insert> for InsertStatement {
                 fields: columns.try_into_dialect(dialect)?,
                 data: if let Some(query) = source {
                     match *query.body {
-                        sqlparser::ast::SetExpr::Values(values) => {
-                            values.rows.try_into_dialect(dialect)?
-                        }
+                        sqlparser::ast::SetExpr::Values(values) => values
+                            .rows
+                            .into_iter()
+                            .map(|row| row.content)
+                            .collect::<Vec<_>>()
+                            .try_into_dialect(dialect)?,
                         body => return unsupported!("Unsupported source type for INSERT: {body}"),
                     }
                 } else {

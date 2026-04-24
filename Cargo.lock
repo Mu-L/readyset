@@ -2477,7 +2477,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7705,7 +7705,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.61.0"
-source = "git+https://github.com/readysettech/datafusion-sqlparser-rs?branch=readyset-patched#9f04ebe515a03f8b02b07df34e48baacb7106c0e"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#7eba3ca17fe16471ce32e1c7dad6cc179f5d780f"
 dependencies = [
  "log",
  "recursive",
@@ -7727,7 +7727,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/readysettech/datafusion-sqlparser-rs?branch=readyset-patched#9f04ebe515a03f8b02b07df34e48baacb7106c0e"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#7eba3ca17fe16471ce32e1c7dad6cc179f5d780f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7750,6 +7750,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 

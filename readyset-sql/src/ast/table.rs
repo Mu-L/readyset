@@ -282,7 +282,12 @@ impl TryFromDialect<sqlparser::ast::TableFactor> for TableExpr {
                 let SetExpr::Values(values) = *subquery.body else {
                     unreachable!()
                 };
-                let rows: Vec<Vec<Expr>> = values.rows.try_into_dialect(dialect)?;
+                let rows: Vec<Vec<Expr>> = values
+                    .rows
+                    .into_iter()
+                    .map(|row| row.content)
+                    .collect::<Vec<_>>()
+                    .try_into_dialect(dialect)?;
                 let (table_alias, column_aliases) = match alias {
                     Some(TableAlias { name, columns, .. }) => (
                         Some(name.into_dialect(dialect)),
