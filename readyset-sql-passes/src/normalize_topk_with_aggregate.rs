@@ -380,4 +380,62 @@ mod tests {
             Some(ReadySetError::ExprNotInGroupBy { .. })
         ));
     }
+
+    /// Regression for REA-6340: GROUP BY / ORDER BY mixing numeric ordinal
+    /// references with column references must not trigger `ExprNotInGroupBy`.
+    /// `lib.rs::Rewrite for SelectStatement` runs
+    /// `remove_numeric_field_references` before `normalize_topk_with_aggregate`,
+    /// so by the time the equality check below runs, every `Numeric(n)` has been
+    /// resolved to its underlying SELECT-list expression and both sides of the
+    /// check appear in the same `Expr` form.  These tests mirror that pipeline
+    /// ordering and lock in acceptance of the four shapes from the issue.
+    fn assert_pipeline_accepts(sql: &str) {
+        use crate::remove_numeric_field_references::RemoveNumericFieldReferences;
+        let mut query = parse_query(Dialect::PostgreSQL, sql).unwrap();
+        query.remove_numeric_field_references().unwrap();
+        query
+            .normalize_topk_with_aggregate(Dialect::PostgreSQL)
+            .expect("rewrite pipeline rejected query (REA-6340 regression)");
+    }
+
+    #[test]
+    fn rea_6340_group_by_col_order_by_ordinal() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY pn ORDER BY 2");
+    }
+
+    #[test]
+    fn rea_6340_group_by_col_order_by_col() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY pn ORDER BY pn");
+    }
+
+    #[test]
+    fn rea_6340_group_by_ordinal_order_by_ordinal() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY 2 ORDER BY 2");
+    }
+
+    #[test]
+    fn rea_6340_group_by_ordinal_order_by_col() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY 2 ORDER BY pn");
+    }
+
+    /// Companion to the `rea_6340_*` acceptance tests above: confirms
+    /// `normalize_topk_with_aggregate` *alone* rejects cross-form queries.
+    /// Locks in the pipeline-ordering invariant — if the lib.rs `Rewrite` impl
+    /// is ever changed to run `normalize_topk_with_aggregate` before
+    /// `remove_numeric_field_references`, REA-6340 reproduces.  This test
+    /// won't fire in that scenario, but documents the load-bearing dependency
+    /// for future maintainers reading the file.
+    #[test]
+    fn rea_6340_normalize_alone_rejects_cross_form() {
+        let mut query = parse_query(
+            Dialect::PostgreSQL,
+            "SELECT SUM(status), pn FROM t GROUP BY pn ORDER BY 2",
+        )
+        .unwrap();
+        let result = query.normalize_topk_with_aggregate(Dialect::PostgreSQL);
+        assert!(matches!(
+            result.err(),
+            Some(ReadySetError::ExprNotInGroupBy { .. })
+        ));
+    }
 }

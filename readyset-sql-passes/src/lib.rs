@@ -226,12 +226,12 @@ impl Rewrite for SelectStatement {
         trace!(parent: &span, pass="expand_stars", query = %self.display(sql_dialect));
         self.expand_implied_tables(&context)?;
         trace!(parent: &span, pass="expand_implied_tables", query = %self.display(sql_dialect));
+        self.remove_numeric_field_references()?;
+        trace!(parent: &span, pass="remove_numeric_field_references", query = %self.display(sql_dialect));
         self.normalize_topk_with_aggregate(&context)?;
         trace!(parent: &span, pass="normalize_topk_with_aggregate", query = %self.display(sql_dialect));
         self.detect_problematic_self_joins()?;
         trace!(parent: &span, pass="detect_problematic_self_joins", query = %self.display(sql_dialect));
-        self.remove_numeric_field_references()?;
-        trace!(parent: &span, pass="remove_numeric_field_references", query = %self.display(sql_dialect));
         self.rewrite_table_aliases(query_name, context.table_alias_rewrites())?;
         trace!(parent: &span, pass="rewrite_table_aliases", query = %self.display(sql_dialect));
 
