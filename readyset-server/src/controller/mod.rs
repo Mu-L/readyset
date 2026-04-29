@@ -1965,7 +1965,10 @@ async fn handle_controller_request(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use assert_matches::assert_matches;
+    use petgraph::visit::IntoNodeReferences;
 
     use dataflow::DomainIndex;
     use readyset_client::debug::info::KeyCount;
@@ -2455,6 +2458,362 @@ mod tests {
         assert_eq!(
             res.keys().copied().collect::<Vec<_>>(),
             vec![DomainIndex::from(0)]
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    async fn apply_sql(noria: &mut crate::Handle, sqls: Vec<&str>) {
+        noria
+            .extend_recipe(ChangeList::from_strings(sqls, DataDialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn domain_set(noria: &mut crate::Handle) -> HashSet<DomainIndex> {
+        noria.domains().await.unwrap().keys().copied().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_reclaims_reader_domain() {
+        let (mut noria, shutdown_tx) = start_simple("drop_cache_reclaims_reader_domain").await;
+        eventually! {
+            apply_sql(&mut noria, vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+        assert_eq!(baseline.len(), 1, "table-only baseline = 1 domain");
+
+        apply_sql(
+            &mut noria,
+            vec!["CREATE CACHE q FROM SELECT * FROM t WHERE id = ?;"],
+        )
+        .await;
+        let with_cache = domain_set(&mut noria).await;
+        assert_eq!(
+            with_cache.len(),
+            baseline.len() + 1,
+            "expected exactly one new domain for the cache's reader \
+             (baseline={baseline:?}, with_cache={with_cache:?})",
+        );
+        assert!(baseline.is_subset(&with_cache));
+
+        noria.remove_query(&"q".into()).await.unwrap();
+
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored after dropping the cache \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_reclaims_join_domains() {
+        let (mut noria, shutdown_tx) = start_simple("drop_cache_reclaims_join_domains").await;
+        eventually! {
+            apply_sql(&mut noria, vec![
+                "CREATE TABLE a (id INT PRIMARY KEY, b_id INT);",
+                "CREATE TABLE b (id INT PRIMARY KEY, val INT);",
+            ]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+        assert_eq!(baseline.len(), 2, "two-table baseline = 2 domains");
+
+        apply_sql(
+            &mut noria,
+            vec![
+                "CREATE CACHE qj FROM \
+                 SELECT a.id, b.val FROM a JOIN b ON a.b_id = b.id WHERE a.id = ?;",
+            ],
+        )
+        .await;
+        let with_cache = domain_set(&mut noria).await;
+        // A cross-shard JOIN at sharding=2 introduces shard mergers + a reader: at minimum
+        // the original 2 base domains plus 2 more (shard merger + reader). Assert STRICTLY
+        // greater than 2 new domains so a regression that adds only 1 is caught.
+        assert!(
+            with_cache.len() >= baseline.len() + 2,
+            "expected JOIN cache to add at least 2 domains \
+             (baseline={baseline:?}, with_cache={with_cache:?})",
+        );
+        assert!(baseline.is_subset(&with_cache));
+
+        noria.remove_query(&"qj".into()).await.unwrap();
+
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored after dropping the JOIN cache \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_create_drop_cache_does_not_leak_domains() {
+        let (mut noria, shutdown_tx) =
+            start_simple("repeated_create_drop_cache_does_not_leak_domains").await;
+        eventually! {
+            apply_sql(&mut noria, vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+
+        for _ in 0..5 {
+            apply_sql(
+                &mut noria,
+                vec!["CREATE CACHE q FROM SELECT * FROM t WHERE id = ?;"],
+            )
+            .await;
+            noria.remove_query(&"q".into()).await.unwrap();
+        }
+
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored across 5 create+drop cycles \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_table_reclaims_base_domain() {
+        let (mut noria, shutdown_tx) = start_simple("drop_table_reclaims_base_domain").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE keep (id INT PRIMARY KEY);",
+                            "CREATE TABLE gone (id INT PRIMARY KEY);",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
+        let before: HashSet<DomainIndex> = noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(before.len(), 2);
+
+        noria
+            .extend_recipe(
+                ChangeList::from_strings(vec!["DROP TABLE gone;"], DataDialect::DEFAULT_MYSQL)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let after: HashSet<DomainIndex> = noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(
+            after.len(),
+            1,
+            "expected the dropped table's base domain to be reclaimed \
+             (before={before:?}, after={after:?})"
+        );
+        // The remaining domain must be a subset of the original — the surviving table's
+        // domain identity is preserved, no fresh domain was conjured.
+        assert!(
+            after.is_subset(&before),
+            "expected the surviving table's DomainIndex to be one of the originals \
+             (before={before:?}, after={after:?})"
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    /// Drop a CACHE backed by a VALUES clause and verify that:
+    ///   - the Constant node's domain IS reclaimed (Constants are per-query inline data with no
+    ///     replication cost; they should be reaped alongside their owning query, the same way
+    ///     Readers are — only Bases anchor reachability beyond their consumers, since reclaiming
+    ///     a Base would force a full re-replication of its table from upstream); and
+    ///   - no orphan non-dropped graph node is left behind pointing at the reclaimed domain.
+    ///
+    /// This test would fail if the seed set were widened to include Constants (e.g. `is_source()`
+    /// instead of `is_base()`), which would keep the Constant's domain alive forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_with_values_reclaims_constant_domain() {
+        let (mut noria, shutdown_tx) =
+            start_simple("drop_cache_with_values_reclaims_constant_domain").await;
+        eventually! {
+            apply_sql(&mut noria, vec!["CREATE TABLE t (id INT PRIMARY KEY);"]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+        assert_eq!(baseline.len(), 1, "table-only baseline = 1 domain");
+
+        // VALUES is supported only when JOINed (standalone VALUES is rejected).
+        apply_sql(
+            &mut noria,
+            vec![
+                "CREATE CACHE qv FROM \
+                 SELECT t.id FROM t \
+                 JOIN (VALUES (1), (2), (3)) AS v(x) ON t.id = v.x \
+                 WHERE t.id = ?;",
+            ],
+        )
+        .await;
+        let with_cache = domain_set(&mut noria).await;
+        assert!(
+            with_cache.len() > baseline.len(),
+            "expected VALUES JOIN cache to add at least one domain \
+             (baseline={baseline:?}, with_cache={with_cache:?})",
+        );
+
+        noria.remove_query(&"qv".into()).await.unwrap();
+
+        // 1) The Constant's domain must be reclaimed alongside the Reader's, returning the
+        //    domain set to baseline. If Constants ever get added to the seed set in
+        //    `find_orphaned_domains`, this assertion will catch it.
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored after dropping the VALUES cache \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        // 2) No node may remain in the graph un-flagged while pointing at a reclaimed domain.
+        //    `process_removal` only walks downstream from MIR seeds, so the Constant and the
+        //    Ingress feeding it are not flagged dropped by the drop path; the reclaim must.
+        let orphans = noria
+            .migrate(|m| {
+                let ds = &m.dataflow_state;
+                ds.ingredients
+                    .node_references()
+                    .filter_map(|(ni, n)| {
+                        if n.is_dropped() || n.is_graph_root() || !n.has_domain() {
+                            return None;
+                        }
+                        let di = n.domain();
+                        if ds.domains.contains_key(&di) {
+                            None
+                        } else {
+                            Some((ni, n.description(), di))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        assert!(
+            orphans.is_empty(),
+            "expected no orphan non-dropped nodes pointing at reclaimed domains, got {orphans:?}",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    /// `Materializations.paths`, `Materializations.redundant_partial`, and
+    /// `domain_node_index_pairs` are all keyed by `NodeIndex` / `DomainIndex` and grow
+    /// monotonically as caches are added. They MUST be cleaned by the reclaim path or we'd
+    /// substitute one leak for another.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_does_not_leak_internal_maps() {
+        let (mut noria, shutdown_tx) = start_simple("drop_cache_does_not_leak_internal_maps").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
+
+        async fn snapshot(noria: &mut crate::Handle) -> (usize, usize, usize, usize) {
+            noria
+                .migrate(|m| {
+                    let ds = &m.dataflow_state;
+                    (
+                        ds.materializations.paths.len(),
+                        ds.materializations.redundant_partial.len(),
+                        ds.domain_node_index_pairs.len(),
+                        ds.domain_nodes.len(),
+                    )
+                })
+                .await
+        }
+
+        let baseline = snapshot(&mut noria).await;
+
+        for _ in 0..5 {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE CACHE q FROM SELECT * FROM t WHERE id = ?;"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            noria.remove_query(&"q".into()).await.unwrap();
+        }
+
+        let after = snapshot(&mut noria).await;
+        // (paths, redundant_partial, domain_node_index_pairs, domain_nodes)
+        assert_eq!(
+            after, baseline,
+            "expected internal maps to be stable across create+drop cycles \
+             (baseline={baseline:?}, after={after:?})",
+        );
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_all_caches_preserves_base_table_domain() {
+        let (mut noria, shutdown_tx) =
+            start_simple("drop_all_caches_preserves_base_table_domain").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
+        // Capture the base table's domain identity from the table-only state, so that we can
+        // assert the *exact same* DomainIndex is still present after dropping all caches.
+        // Replication writes into this domain; reclaiming it would break ongoing ingest.
+        let base_domains: HashSet<DomainIndex> =
+            noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(base_domains.len(), 1);
+
+        noria
+            .extend_recipe(
+                ChangeList::from_strings(
+                    vec![
+                        "CREATE CACHE q1 FROM SELECT * FROM t WHERE id = ?;",
+                        "CREATE CACHE q2 FROM SELECT x FROM t WHERE id = ?;",
+                    ],
+                    DataDialect::DEFAULT_MYSQL,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        noria.remove_all_queries().await.unwrap();
+
+        let after: HashSet<DomainIndex> = noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(
+            after, base_domains,
+            "expected the base table's domain to be preserved across DROP ALL CACHES \
+             (before={base_domains:?}, after={after:?})"
         );
 
         shutdown_tx.shutdown().await;

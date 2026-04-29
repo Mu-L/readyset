@@ -1098,11 +1098,18 @@ impl Leader {
                 ds.kill_domains(downstream_domains).await?;
             }
 
-            // 3. Try to recover all now-non-running domains
+            // 3. Try to recover all now-non-running domains. Skip any domain whose
+            //    `domain_nodes` entry has already been purged — that means it was reclaimed
+            //    by `reclaim_orphaned_domains` (the recipe no longer references it, so
+            //    there's nothing to re-place).
             info!(?domains_to_recover, "Recovering domains");
             let domain_nodes: HashMap<_, HashSet<_>> = domains_to_recover
                 .into_iter()
-                .map(|d| (d, ds.domain_nodes[&d].values().copied().collect()))
+                .filter_map(|d| {
+                    ds.domain_nodes
+                        .get(&d)
+                        .map(|nm| (d, nm.values().copied().collect()))
+                })
                 .collect();
             info!(num_domains = %domain_nodes.len(), "Recovering domains");
             let dmp = ds.plan_recovery(&domain_nodes).await?;

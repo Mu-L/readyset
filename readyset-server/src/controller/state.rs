@@ -13,7 +13,7 @@
 //! to manipulate it in a thread-safe way.
 
 use std::cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
@@ -118,6 +118,9 @@ pub struct DfState {
 
     /// ID for the root node in the graph. This is used to retrieve a list of base tables.
     pub(super) source: NodeIndex,
+    /// Monotonic counter used to allocate fresh [`DomainIndex`] values. Never decremented, even
+    /// when domains are reclaimed via [`Self::reclaim_orphaned_domains`]; `next_domain()` always
+    /// hands out a new index.
     pub(super) ndomains: usize,
     pub(super) sharding: Option<usize>,
 
@@ -1656,6 +1659,12 @@ impl DfState {
         // are super entangled with the recipe and the graph.
         let mut new = self.recipe.clone();
 
+        // Only DROP-bearing migrations can produce orphaned domains. Skip the (read-only but
+        // O(N+E)) reachability scan for pure ADD/ALTER migrations.
+        let has_drops = changelist
+            .changes()
+            .any(|c| matches!(c, Change::Drop { .. }));
+
         let r = self
             .migrate(dry_run, changelist.dialect, |mig| {
                 new.activate(mig, changelist, table_statuses)
@@ -1665,6 +1674,22 @@ impl DfState {
         match r {
             Ok(res) => {
                 self.recipe = new;
+                if !dry_run && has_drops {
+                    // Domains whose nodes were all dropped by this migration (e.g. the readers
+                    // and shard mergers backing a `DROP CACHE`d query) keep their runtime OS
+                    // threads alive otherwise, exhausting tracing-subscriber's per-thread slot
+                    // pool over time. See REA-5827.
+                    //
+                    // Reclamation is OS-resource cleanup, not a correctness operation: never let
+                    // it demote a successful migration. Any kill failures are logged and the
+                    // orphaned controller bookkeeping is purged regardless.
+                    if let Err(e) = self.reclaim_orphaned_domains().await {
+                        warn!(
+                            error = %e,
+                            "reclaim_orphaned_domains failed; will retry next migration",
+                        );
+                    }
+                }
                 Ok(res)
             }
             Err(e) => {
@@ -1980,6 +2005,158 @@ impl DfState {
             }
         }
 
+        Ok(())
+    }
+
+    /// Find domains whose nodes are all orphaned — that is, no non-dropped Reader or Base remains
+    /// that reaches them via incoming edges. Used to identify domains whose runtime threads can
+    /// be reclaimed after a drop migration (see REA-5827).
+    ///
+    /// We can't just check `is_dropped()` per node: when a cache is dropped, the drop path only
+    /// flags the Reader itself; routing nodes (Ingress, Egress) and Constant (`VALUES`) nodes
+    /// feeding that Reader stay un-flagged. So we instead compute reachability backwards from
+    /// every live Reader and Base, and consider any domain disjoint from that set as orphaned.
+    ///
+    /// Bases — but not Constants — anchor reachability even when no live Reader points to them.
+    /// A Base survives as long as its underlying table exists (`DROP TABLE` flags it dropped),
+    /// because tearing down a Base would force the whole table to be re-replicated from upstream.
+    /// Constants are per-query inline data with no such cost: when their owning query is gone,
+    /// they should be reclaimed alongside it.
+    pub(super) fn find_orphaned_domains(&self) -> HashSet<DomainIndex> {
+        let n_nodes = self.ingredients.node_count();
+        let mut needed: HashSet<NodeIndex> = HashSet::with_capacity(n_nodes);
+        let mut queue: VecDeque<NodeIndex> = VecDeque::with_capacity(n_nodes / 4 + 1);
+        for (ni, n) in self.ingredients.node_references() {
+            if n.is_dropped() {
+                continue;
+            }
+            if (n.is_reader() || n.is_base()) && needed.insert(ni) {
+                queue.push_back(ni);
+            }
+        }
+        while let Some(ni) = queue.pop_front() {
+            for parent in self
+                .ingredients
+                .neighbors_directed(ni, petgraph::Direction::Incoming)
+            {
+                if !self.ingredients[parent].is_dropped() && needed.insert(parent) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+
+        self.domain_nodes
+            .iter()
+            .filter(|(_, nodes)| nodes.iter().all(|(_, ni)| !needed.contains(ni)))
+            .map(|(di, _)| *di)
+            .collect()
+    }
+
+    /// Kill the runtime threads of any orphaned domains and purge their bookkeeping from the
+    /// controller (`self.domains`, `self.domain_nodes`, `self.domain_node_index_pairs`,
+    /// [`ChannelCoordinator`], and [`Materializations`] entries) and flag any non-dropped
+    /// graph nodes that still belonged to those domains as dropped — closing the orphan loop the
+    /// upstream drop path leaves open for routing/Constant nodes (see REA-5827).
+    ///
+    /// This is best-effort by design: the kill RPCs may fail mid-fan-out (worker partitioned,
+    /// timed out, gone). We log and proceed — the migration's logical outcome has already
+    /// committed, and any controller-local bookkeeping must be purged regardless to avoid
+    /// re-issuing kill RPCs against the same dead domains on every subsequent migration.
+    pub(super) async fn reclaim_orphaned_domains(&mut self) -> ReadySetResult<()> {
+        let start = Instant::now();
+        let orphaned = self.find_orphaned_domains();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        // Snapshot replica addresses to evict from the channel coordinator before
+        // `kill_domains` clears `DomainHandle::shards` via `remove_assignment`. Note that
+        // `dh.assignments()` already filters unscheduled (None) replicas, which is what we
+        // want — those were never registered with the coordinator.
+        let replica_addrs: Vec<ReplicaAddress> = orphaned
+            .iter()
+            .filter_map(|di| self.domains.get(di))
+            .flat_map(|dh| dh.assignments().map(|(addr, _)| addr))
+            .collect();
+
+        if let Err(e) = self.kill_domains(orphaned.iter().copied()).await {
+            warn!(
+                error = %e,
+                ?orphaned,
+                "kill_domains partial failure during reclamation; purging local state anyway",
+            );
+        }
+
+        for addr in replica_addrs {
+            self.channel_coordinator.remove(addr);
+        }
+
+        // Flag any non-dropped graph nodes that lived in the reclaimed domains. This handles
+        // routing nodes (Ingress, Egress) that the drop path didn't walk to, and Constant
+        // nodes whose only consumer was the dropped Reader. Without this, those nodes stay
+        // un-flagged in `self.ingredients` while their `domain()` references a domain that's
+        // about to be removed from `self.domains` — a "node has no living domain" invariant
+        // violation that breaks recovery and `materialization_info`.
+        //
+        // We also disconnect their edges to any non-dropped neighbor, otherwise the next
+        // migration's `routing::connect` walk would follow an Egress→Ingress edge into a
+        // freshly-dropped Ingress and trip the `is_ingress()` invariant.
+        let mut nodes_to_flag: Vec<NodeIndex> = Vec::new();
+        for di in &orphaned {
+            if let Some(nodes) = self.domain_nodes.get(di) {
+                nodes_to_flag.extend(nodes.iter().map(|(_, ni)| *ni));
+            }
+        }
+        for ni in &nodes_to_flag {
+            let neighbors: Vec<NodeIndex> = self
+                .ingredients
+                .neighbors_undirected(*ni)
+                .filter(|nbr| !self.ingredients[*nbr].is_dropped())
+                .collect();
+            for nbr in neighbors {
+                if let Some(edge) = self.ingredients.find_edge(*ni, nbr) {
+                    self.ingredients.remove_edge(edge);
+                }
+                if let Some(edge) = self.ingredients.find_edge(nbr, *ni) {
+                    self.ingredients.remove_edge(edge);
+                }
+            }
+            if let Some(node) = self.ingredients.node_weight_mut(*ni) {
+                if !node.is_dropped() {
+                    node.remove();
+                }
+            }
+            self.materializations.paths.remove(ni);
+            self.materializations.redundant_partial.remove(ni);
+        }
+        // `redundant_partial` maps partial-parent → full-duplicate; if either side is gone,
+        // drop the entry.
+        let stale_keys: Vec<NodeIndex> = self
+            .materializations
+            .redundant_partial
+            .iter()
+            .filter(|(k, v)| {
+                self.ingredients[**k].is_dropped() || self.ingredients[**v].is_dropped()
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale_keys {
+            self.materializations.redundant_partial.remove(&k);
+        }
+
+        for di in &orphaned {
+            self.domains.remove(di);
+            self.domain_nodes.remove(di);
+            self.domain_node_index_pairs.remove(di);
+        }
+
+        counter!(recorded::CONTROLLER_RECLAIMED_DOMAINS).increment(orphaned.len() as u64);
+        info!(
+            count = orphaned.len(),
+            elapsed_us = start.elapsed().as_micros() as u64,
+            ?orphaned,
+            "Reclaimed orphaned domains",
+        );
         Ok(())
     }
 

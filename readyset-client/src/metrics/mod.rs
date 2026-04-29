@@ -148,6 +148,9 @@ pub mod recorded {
     /// the `commit` call.
     pub const CONTROLLER_MIGRATION_TIME: &str = "readyset_controller.migration_time_us";
 
+    /// Counter: Number of orphaned domains reclaimed by the controller.
+    pub const CONTROLLER_RECLAIMED_DOMAINS: &str = "readyset_controller.reclaimed_domains";
+
     /// Gauge: Migration in progress indicator. Set to 1 when a migration
     /// is in progress, 0 otherwise.
     pub const CONTROLLER_MIGRATION_IN_PROGRESS: &str = "readyset_controller.migration_in_progress";
