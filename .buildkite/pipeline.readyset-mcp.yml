@@ -27,7 +27,9 @@ steps:
       fi
       cd /workdir/public
       rustup target add $$MUSL_TARGET
-      cargo --locked build --package readyset-mcp --release --target  $$MUSL_TARGET
+      # Must set vendored-openssl feature when building for musl:
+      cargo --locked build --package readyset-mcp --features readyset-mcp/vendored-openssl \
+        --release --target  $$MUSL_TARGET
       cd /workdir/public/target/$$MUSL_TARGET/release
       strip readyset-mcp
       tar -czf readyset-mcp-$$MUSL_TARGET.tar.gz readyset-mcp

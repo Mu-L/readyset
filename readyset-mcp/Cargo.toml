@@ -14,13 +14,22 @@ path = "src/lib.rs"
 name = "readyset-mcp"
 path = "src/main.rs"
 
+# To get a statically-linked bin for readyset-mcp, we need to use the musl target to include openssl
+# with "vendored" set.  However, if we set "vendored" directly in the dependencies list, it will
+# apply universally across the entire workspace, which we do not want.  This maneuver hides the
+# "vendored" feature behind another optional feature flag, "vendored-openssl" which should be set
+# when building the readyset-mcp server.
+[features]
+vendored-openssl = ["openssl/vendored"]
+
 [dependencies]
 anyhow = { workspace = true }
 mysql_async = { workspace = true }
 native-tls = { workspace = true }
+openssl = { version = "0.10" }
 pem = { workspace = true }
 postgres-native-tls = { workspace = true }
-openssl = { version = "0.10", features = ["vendored"] }
+
 rmcp = { version = "1.4", features = ["server", "transport-io"] }
 schemars = "1"
 serde = { workspace = true, features = ["derive"] }
