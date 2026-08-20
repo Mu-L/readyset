@@ -320,6 +320,12 @@ opt-level = 2  # optimize deps (compiled once, cached by sccache) for faster tes
 debug = true
 lto = "thin"
 
+[profile.ci-release]
+inherits = "release"
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
 [profile.release-fat-lto]
 inherits = "release"
 lto = "fat"
@@ -341,7 +347,7 @@ debug = false
 strip = "debuginfo"
 
 [profile.antithesis]
-inherits = "release"
+inherits = "ci-release"
 lto = "off"
 
 [workspace.lints.rust]
