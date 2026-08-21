@@ -62,6 +62,9 @@ struct AutoParameterizeVisitor {
     autoparameterize_ranges: bool,
     out: Vec<(usize, Literal)>,
     in_supported_position: bool,
+    /// How many placeholders the walk has passed, which is the index the next parameter takes.
+    /// Placeholders already in the query -- whether the caller wrote them or an earlier phase
+    /// produced them -- are counted as the walk reaches them, so it starts from zero.
     param_index: usize,
     query_depth: u8,
     visit_limit_clause: bool,
@@ -160,8 +163,11 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
                         for expr in exprs {
                             if let Expr::Literal(lit) = expr {
                                 match lit {
-                                    Literal::Placeholder(_) => continue,
-                                    _ => self.replace_literal(lit),
+                                    // A placeholder holds a parameter position of its own, so
+                                    // the positions after it are numbered past it.
+                                    Literal::Placeholder(_) => self.param_index += 1,
+                                    _ if self.autoparameterize_equals => self.replace_literal(lit),
+                                    _ => {}
                                 }
                             }
                         }
@@ -572,7 +578,6 @@ pub fn auto_parameterize_query(
     let mut visitor = AutoParameterizeVisitor {
         autoparameterize_equals,
         autoparameterize_ranges,
-        param_index: prev.len(),
         out: prev,
         visit_limit_clause,
         cap_predicates,
@@ -1321,6 +1326,51 @@ mod tests {
                 "SELECT id FROM posts WHERE id <= 10",
                 "SELECT id FROM posts WHERE id <= ?",
                 vec![(0, 10.into())],
+            );
+        }
+    }
+
+    /// Every parameter the pass emits is indexed by how many placeholders precede it, so an
+    /// index has to account for the placeholders already in the query -- both the ones the
+    /// user wrote and the ones an earlier phase lifted.
+    mod parameter_indexing {
+        use super::*;
+
+        /// The Readyset rewrite runs the pass twice: once without the limit clause, then again
+        /// over the result carrying the first run's parameters. The second run's own parameters
+        /// follow the first run's, with no gap.
+        #[test]
+        fn second_phase_continues_first_phase_numbering() {
+            let mut query = parse_select_statement(
+                "SELECT * FROM posts WHERE id = 1 LIMIT 3 OFFSET 6",
+                Dialect::MySQL,
+            );
+            let phase_one = auto_parameterize_query(&mut query, Vec::new(), false, false).unwrap();
+            assert_eq!(phase_one, vec![(0, 1.into())]);
+
+            let phase_two = auto_parameterize_query(&mut query, phase_one, false, true).unwrap();
+            assert_eq!(phase_two, vec![(0, 1.into()), (1, 6.into())]);
+        }
+
+        /// A placeholder inside a row comparison occupies a parameter position, so the literal
+        /// beside it is the second parameter, not the first.
+        #[test]
+        fn row_equality_counts_an_existing_placeholder() {
+            test_auto_parameterize_mysql(
+                "SELECT id FROM users WHERE (name, age) = (?, 27)",
+                "SELECT id FROM users WHERE (name, age) = (?, ?)",
+                vec![(1, 27.into())],
+            );
+        }
+
+        /// A range placeholder puts the pass in range-only mode. A row equality is an equality,
+        /// so it stays inline rather than joining the range parameters in one query.
+        #[test]
+        fn row_equality_respects_range_only_mode() {
+            test_auto_parameterize_mysql(
+                "SELECT id FROM users WHERE (name, age) = ('Bob', 27) AND score > ?",
+                "SELECT id FROM users WHERE (name, age) = ('Bob', 27) AND score > ?",
+                vec![],
             );
         }
     }

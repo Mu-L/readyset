@@ -70,3 +70,11 @@ $1 = 1
 $2 = 1
 ----
 1
+
+# A literal beside the placeholder is lifted, so the client binds one value and the pass supplies
+# the other. The lifted one takes the position after the placeholder, not the placeholder's own.
+query I rowsort
+SELECT id FROM t WHERE (b, d) = ($1, 2)
+$1 = 1
+----
+5
