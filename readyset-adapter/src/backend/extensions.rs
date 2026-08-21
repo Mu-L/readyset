@@ -38,9 +38,8 @@ use readyset_sql::ast::{
     ModifyUserStatement, ProxiedQueriesOptions, Relation, ShallowCacheAllowlistChange,
     ShallowCacheAllowlistKind, ShowStatement, SqlQuery, TrxCachePolicy,
 };
-use readyset_sql_passes::adapter_rewrites::{DfQueryParameters, LiteralSlots};
+use readyset_sql_passes::DetectBucketFunctions;
 use readyset_sql_passes::shallow::rewrite_shallow;
-use readyset_sql_passes::{DetectBucketFunctions, adapter_rewrites};
 use readyset_telemetry_reporter::TelemetryEvent;
 use readyset_util::SizeOf;
 use readyset_util::redacted::{RedactedString, Sensitive};
@@ -57,21 +56,6 @@ use super::{
 use crate::cache_acl::{AclMessage, CacheCreator, PassTrigger};
 use crate::utils::create_dummy_column;
 use crate::{QueryHandler, UpstreamDatabase, create_dummy_schema};
-
-/// A cache that keeps its author's literals inline, waiting on the cache itself being created.
-///
-/// A read reaches such a cache by matching what it carries against [`Self::slots`], and is then
-/// served from the form and parameters registered here rather than from a rewrite of its own.
-struct InlineLiteralRegistration {
-    /// The canonical shape a read hashes to, which is what the cache is filed under.
-    shape: QueryId,
-    /// What the cache holds at each of that shape's parameter positions.
-    slots: LiteralSlots,
-    /// The cache's own form.
-    request: ViewCreateRequest,
-    /// Its parameters, whose values a matching read replaces with its own.
-    params: DfQueryParameters,
-}
 
 impl<DB, Handler> Backend<DB, Handler>
 where
@@ -497,7 +481,7 @@ where
         ReadySetResult<ViewCreateRequest>,
         ReadySetResult<ShallowViewRequest>,
         SchemaGeneration,
-        Option<InlineLiteralRegistration>,
+        Option<super::InlineLiteralRegistration>,
     )> {
         match inner {
             CacheInner::Statement { deep, shallow } => {
@@ -539,53 +523,21 @@ where
                         ));
                     }
                     match deep {
-                        Ok(mut deep) => {
-                            // The shape a read hashes to, and what this statement holds at its
-                            // positions. Both come from the form that parameterizes everything,
-                            // which the cache's own rewrite is about to depart from.
-                            let shape = (!rewrite_params.autoparameterize)
-                                .then(|| {
-                                    let mut params = rewrite_params;
-                                    params.autoparameterize = true;
-                                    let mut shape = (*deep).clone();
-                                    adapter_rewrites::rewrite_query(
-                                        &mut shape,
-                                        params,
-                                        &rewrite_context,
-                                    )
-                                    .map(|p| {
-                                        (
-                                            QueryId::from_select(
-                                                &shape,
-                                                rewrite_context.search_path(),
-                                            ),
-                                            p.slots().clone(),
-                                        )
-                                    })
-                                })
-                                .transpose()?;
-                            match adapter_rewrites::rewrite_query(
-                                &mut deep,
-                                rewrite_params,
-                                &rewrite_context,
-                            ) {
-                                Ok(params) => {
-                                    let request = ViewCreateRequest::new(
-                                        *deep,
-                                        rewrite_context.search_path().to_owned(),
-                                    );
-                                    registration =
-                                        shape.map(|(shape, slots)| InlineLiteralRegistration {
-                                            shape,
-                                            slots,
-                                            request: request.clone(),
-                                            params,
-                                        });
-                                    Ok(request)
-                                }
-                                Err(e) => Err(e),
+                        // Creating a cache and recovering one after a restart derive its form and
+                        // its registration the same way, so a recovered cache is reachable by the
+                        // reads the created one was.
+                        Ok(deep) => match super::inline_literal_cache_form(
+                            &deep,
+                            rewrite_params,
+                            &rewrite_context,
+                            rewrite_context.search_path().to_owned(),
+                        ) {
+                            Ok((request, inline)) => {
+                                registration = inline;
+                                Ok(request)
                             }
-                        }
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(ReadySetError::UnparseableQuery(e)),
                     }
                 };

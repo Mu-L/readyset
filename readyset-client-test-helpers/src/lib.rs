@@ -24,8 +24,8 @@ use readyset_adapter::query_status_cache::{
 use readyset_adapter::rls_coordinator::RlsCoordinator;
 use readyset_adapter::shallow_refresh_pool::ShallowRefreshPool;
 use readyset_adapter::{
-    recreate_shallow_caches, Backend, QueryHandler, ReadySetStatusReporter, UpstreamConfig,
-    UpstreamDatabase, ViewsSynchronizer,
+    recreate_inline_literal_caches, recreate_shallow_caches, Backend, QueryHandler,
+    ReadySetStatusReporter, UpstreamConfig, UpstreamDatabase, ViewsSynchronizer,
 };
 use readyset_client::consensus::{Authority, AuthorityControl, LocalAuthorityStore};
 use readyset_client_metrics::QueryLogMode;
@@ -681,6 +681,18 @@ impl TestBuilder {
             // replay is a no-op; no RLS registry or coordinator is needed here.
             None,
             None,
+        )
+        .await
+        .unwrap();
+
+        // Same for the caches that keep their literals inline.
+        let cache_ddl = authority.cache_ddl_requests().await.unwrap_or_default();
+        recreate_inline_literal_caches(
+            query_status_cache,
+            schema_catalog.clone(),
+            cache_ddl,
+            self.parsing_preset,
+            rewrite_params,
         )
         .await
         .unwrap();

@@ -1931,6 +1931,19 @@ where
                 error!("Failed to recreate shallow caches: {}", e);
             }
         }
+        // A cache that keeps its author's literals inline takes a form no read produces, so it
+        // is registered here from the same persisted DDL the controller replays.
+        if let Ok(cache_ddl_requests) = rt.block_on(adapter_authority.cache_ddl_requests()) {
+            if let Err(e) = rt.block_on(readyset_adapter::recreate_inline_literal_caches(
+                query_status_cache,
+                schema_catalog.clone(),
+                cache_ddl_requests,
+                parsing_preset,
+                adapter_rewrite_params,
+            )) {
+                error!("Failed to recover inline-literal caches: {}", e);
+            }
+        }
         // Seed the three shallow-cache allowlists (function, variable, schema)
         // from the authority so any `ALTER READYSET ... SHALLOW CACHE ALLOWED
         // ...` persisted by an earlier run survives this restart. The handles are

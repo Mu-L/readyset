@@ -1,14 +1,83 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use readyset_client::consensus::LocalAuthorityStore;
+use readyset_server::{Authority, DurabilityMode, Handle, LocalAuthority};
+use readyset_sql_parsing::ParsingPreset;
+use readyset_util::eventually;
+use tempfile::TempDir;
+use mysql_async::params::Params;
 use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
+use mysql_async::prelude::{FromRow, Queryable};
 use readyset_adapter::query_status_cache::MigrationStyle;
 use readyset_adapter::backend::{MigrationMode, QueryInfo};
 use readyset_client_metrics::QueryDestination;
 use readyset_client_test_helpers::mysql_helpers::{self, MySQLAdapter};
 use readyset_client_test_helpers::{TestBuilder, sleep};
-use readyset_server::Handle;
-use readyset_sql_parsing::ParsingPreset;
 use readyset_util::shutdown::ShutdownSender;
 use test_utils::{tags, upstream};
+
+/// Run `query` until the adapter reports it served by `expected`, then hand back its rows.
+///
+/// A read taken right after its cache is created is served upstream until the cache is ready, and
+/// both sides return the same rows, so where the read went is what the poll waits on. The rows
+/// are the caller's to assert on once it lands.
+async fn eventually_readyset<T>(
+    rs_conn: &mut Conn,
+    query: impl AsRef<str>,
+    expected: QueryDestination,
+) -> Vec<T>
+where
+    T: FromRow + Send + 'static,
+{
+    let query = query.as_ref();
+    let mut last = None;
+    for _ in 0..40 {
+        let rows: Vec<T> = rs_conn.query(query).await.unwrap();
+        match last_target(rs_conn).await {
+            (destination, _) if destination == expected => return rows,
+            info => last = Some(info),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (destination, reason) = last.expect("at least one attempt");
+    panic!("`{query}` went to {destination:?}, expected {expected:?}: {reason}");
+}
+
+/// As [`eventually_readyset`], for a read whose values the client binds.
+async fn eventually_readyset_exec<T, P>(
+    rs_conn: &mut Conn,
+    query: impl AsRef<str>,
+    params: P,
+    expected: QueryDestination,
+) -> Vec<T>
+where
+    T: FromRow + Send + 'static,
+    P: Into<Params> + Send + Clone,
+{
+    let query = query.as_ref();
+    let mut last = None;
+    for _ in 0..40 {
+        let rows: Vec<T> = rs_conn.exec(query, params.clone()).await.unwrap();
+        match last_target(rs_conn).await {
+            (destination, _) if destination == expected => return rows,
+            info => last = Some(info),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (destination, reason) = last.expect("at least one attempt");
+    panic!("`{query}` went to {destination:?}, expected {expected:?}: {reason}");
+}
+
+/// The destination the adapter reports for the previous statement, with its reason.
+async fn last_target(rs_conn: &mut Conn) -> (QueryDestination, String) {
+    let info: QueryInfo = rs_conn
+        .query_first("EXPLAIN LAST STATEMENT")
+        .await
+        .unwrap()
+        .unwrap();
+    (info.destination, info.reason)
+}
 
 /// Fire an `EXPLAIN LAST STATEMENT` and assert where the previous query went.
 async fn assert_last_target_was(rs_conn: &mut Conn, expected: QueryDestination) {
@@ -79,31 +148,36 @@ async fn a_literal_read_reaches_a_cache_that_kept_its_literal() {
         )
         .await
         .unwrap();
-    sleep().await;
 
     // Ad-hoc, spelling out the literal the cache kept: served by that cache.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'active'",
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
     assert_eq!(result, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
 
     // The parameterized position still serves every value of itself.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 2 AND status = 'active'",
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
     assert_eq!(result, vec![30]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
 
     // A different value where the cache kept a literal is a different query: upstream, correct.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'archived'",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert_eq!(result, vec![20]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -141,22 +215,24 @@ async fn a_kept_literal_cache_is_reachable_under_deep_then_shallow() {
         )
         .await
         .unwrap();
-    sleep().await;
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'active'",
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
 
     // The literal the cache kept is part of its shape, so another value is another query.
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'archived'",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert_eq!(rows, vec![20]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -284,15 +360,16 @@ async fn one_shape_holds_several_caches() {
         .query_drop("CREATE CACHE by_id WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = 1 AND status = ?")
         .await
         .unwrap();
-    sleep().await;
 
     // Each read reaches the one cache holding the literals it carries.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 2 AND status = 'active'",
+        QueryDestination::Readyset(Some("active".into())),
+    )
+    .await;
     assert_eq!(result, vec![30]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("active".into()))).await;
 
     let result: Vec<i32> = rs_conn
         .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
@@ -307,21 +384,24 @@ async fn one_shape_holds_several_caches() {
 
     // Dropping one gives up only its own claim: the others still serve.
     rs_conn.query_drop("DROP CACHE archived").await.unwrap();
-    sleep().await;
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 2 AND status = 'active'",
+        QueryDestination::Readyset(Some("active".into())),
+    )
+    .await;
     assert_eq!(result, vec![30]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("active".into()))).await;
 
     // And the read whose literals only the dropped cache held goes upstream.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 2 AND status = 'archived'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 2 AND status = 'archived'",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert!(result.is_empty());
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -338,17 +418,18 @@ async fn a_cache_naming_no_option_parameterizes_every_literal() {
         .query_drop("CREATE CACHE every FROM SELECT v FROM t WHERE id = ? AND status = 'active'")
         .await
         .unwrap();
-    sleep().await;
 
     // The literal the author spelled out became a parameter, so the cache serves other values
     // of it too.
     for (status, expected) in [("active", vec![10]), ("archived", vec![20])] {
-        let result: Vec<i32> = rs_conn
-            .query(format!("SELECT v FROM t WHERE id = 1 AND status = '{status}'"))
-            .await
-            .unwrap();
+
+        let result: Vec<i32> = eventually_readyset(
+            &mut rs_conn,
+            format!("SELECT v FROM t WHERE id = 1 AND status = '{status}'"),
+            QueryDestination::Readyset(Some("every".into())),
+        )
+        .await;
         assert_eq!(result, expected, "status = {status}");
-        assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("every".into()))).await;
     }
 
     shutdown_tx.shutdown().await;
@@ -372,27 +453,28 @@ async fn a_read_keeps_its_own_limit() {
         .query_drop("CREATE CACHE paged WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE status = 'active' LIMIT 1")
         .await
         .unwrap();
-    sleep().await;
 
-    let one: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'active' LIMIT 1")
-        .await
-        .unwrap();
+    let one: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'active' LIMIT 1",
+        QueryDestination::Readyset(Some("paged".into())),
+    )
+    .await;
     assert_eq!(one.len(), 1);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("paged".into()))).await;
 
     // Two rows carry 'active'. The read asking for both has to get both.
-    let mut both: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'active' LIMIT 10")
-        .await
-        .unwrap();
+
+    let mut both: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'active' LIMIT 10",
+        QueryDestination::Readyset(Some("paged".into())),
+    )
+    .await;
     both.sort();
     assert_eq!(both, vec![10, 30], "the read's own LIMIT has to bound it");
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("paged".into()))).await;
 
     shutdown_tx.shutdown().await;
 }
-
 
 /// `AUTOPARAM ON` is accepted and parameterizes, which is what an absent clause does too. It is
 /// kept so a statement naming it round-trips through the DDL the authority persists.
@@ -410,22 +492,24 @@ async fn a_cache_naming_autoparam_on_parameterizes() {
         )
         .await
         .unwrap();
-    sleep().await;
 
     // Both literals became parameters, so a read naming other values reaches the same cache.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
-        .await
-        .unwrap();
-    assert_eq!(result, vec![30]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("opened".into()))).await;
 
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
-        .await
-        .unwrap();
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 2 AND status = 'active'",
+        QueryDestination::Readyset(Some("opened".into())),
+    )
+    .await;
+    assert_eq!(result, vec![30]);
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'archived'",
+        QueryDestination::Readyset(Some("opened".into())),
+    )
+    .await;
     assert_eq!(result, vec![20]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("opened".into()))).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -450,23 +534,26 @@ async fn a_kept_literal_does_not_hide_a_parameterized_cache() {
         .query_drop("CREATE CACHE both FROM SELECT v FROM t WHERE id = ? AND status = ?")
         .await
         .unwrap();
-    sleep().await;
 
     // The literal this read spells out is the one `kept` holds inline.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'active'",
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
     assert_eq!(result, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
 
     // No cache kept this one, so the parameterized cache serves it.
-    let result: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
-        .await
-        .unwrap();
+
+    let result: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'archived'",
+        QueryDestination::Readyset(Some("both".into())),
+    )
+    .await;
     assert_eq!(result, vec![20]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("both".into()))).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -631,18 +718,17 @@ async fn a_placeholder_in_a_nested_statement_is_refused() {
         )
         .await
         .unwrap();
-    sleep().await;
 
-    let got: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
-        .await
-        .unwrap();
+    let got: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'active'",
+        QueryDestination::Readyset(Some("flat".into())),
+    )
+    .await;
     assert_eq!(got, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("flat".into()))).await;
 
     shutdown_tx.shutdown().await;
 }
-
 
 /// A cache that keeps its literals inline is reached by an ad-hoc read, which carries its
 /// literals as text.
@@ -663,15 +749,16 @@ async fn a_prepared_read_reaches_a_per_cache_off_cache() {
         )
         .await
         .unwrap();
-    sleep().await;
 
     // The ad-hoc form carries its literals as text and reaches the cache directly.
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND status = 'active'",
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
 
     let rows: Vec<i32> = rs_conn
         .exec("SELECT v FROM t WHERE id = ? AND status = 'active'", (1,))
@@ -682,7 +769,6 @@ async fn a_prepared_read_reaches_a_per_cache_off_cache() {
 
     shutdown_tx.shutdown().await;
 }
-
 
 /// The cache's parameters take their values from two places at once: a position this statement
 /// spells out is filled from its literal, and one it binds is filled by the client. They have to
@@ -703,44 +789,43 @@ async fn a_prepared_read_interleaves_its_literals_with_its_bound_values() {
         )
         .await
         .unwrap();
-    sleep().await;
 
     let served = QueryDestination::Readyset(Some("mixed".into()));
 
     // `id` spelled out, `v` bound: the literal fills the cache's first parameter and the client's
     // value fills the second.
-    let rows: Vec<i32> = rs_conn
-        .exec(
-            "SELECT v FROM t WHERE id = 1 AND v = ? AND status = 'active'",
-            (10,),
-        )
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset_exec(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND v = ? AND status = 'active'",
+        (10,),
+        served.clone(),
+    )
+    .await;
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, served.clone()).await;
 
     // A value matching no row still reaches the cache, which is what says the key was built in
     // the right order rather than landing on another row by luck.
-    let rows: Vec<i32> = rs_conn
-        .exec(
-            "SELECT v FROM t WHERE id = 1 AND v = ? AND status = 'active'",
-            (30,),
-        )
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset_exec(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = 1 AND v = ? AND status = 'active'",
+        (30,),
+        served.clone(),
+    )
+    .await;
     assert!(rows.is_empty());
-    assert_last_target_was(&mut rs_conn, served.clone()).await;
 
     // The other way round: `v` spelled out, `id` bound. The same cache, the opposite interleave.
-    let rows: Vec<i32> = rs_conn
-        .exec(
-            "SELECT v FROM t WHERE id = ? AND v = 10 AND status = 'active'",
-            (1,),
-        )
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset_exec(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE id = ? AND v = 10 AND status = 'active'",
+        (1,),
+        served,
+    )
+    .await;
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, served).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -810,7 +895,6 @@ async fn one_prepared_statement_reaches_a_different_cache_per_bound_value() {
 
     shutdown_tx.shutdown().await;
 }
-
 
 /// Rows enough that every limit in the TopK tests is a real bound: three per status, ordered by
 /// `v`, and a `pending` row so a read that matches no cache still proves the upstream answered.
@@ -891,6 +975,112 @@ async fn a_prepared_read_reaches_a_cache_created_after_it_prepared() {
     shutdown_tx.shutdown().await;
 }
 
+/// A cache that keeps its literals inline has to come back from a restart and serve traffic
+/// again. The server replays the cache DDL and re-derives the same form, since it is a function
+/// of the statement alone; the adapter has to recover which shape holds which cache so a read
+/// still reaches it.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+async fn a_kept_literal_cache_survives_a_restart() {
+    readyset_tracing::init_test_logging();
+    let db_name = "autoparam_mode_restart";
+    mysql_helpers::recreate_database(db_name).await;
+
+    let storage_dir = TempDir::new().unwrap();
+    let store = Arc::new(LocalAuthorityStore::new());
+    let new_authority = || -> Arc<Authority> {
+        Arc::new(Authority::from(LocalAuthority::new_with_store(Arc::clone(
+            &store,
+        ))))
+    };
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream_conn.query_drop(T).await.unwrap();
+
+    let first_authority = new_authority();
+    {
+        let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+            .authority(Arc::clone(&first_authority))
+            .durability_mode(DurabilityMode::Permanent)
+            .storage_dir_path(storage_dir.path().to_path_buf())
+            .recreate_database(false)
+            .migration_mode(MigrationMode::OutOfBand)
+            .migration_style(MigrationStyle::Explicit)
+            .replicate_db(db_name)
+            .fallback(true)
+            .build::<MySQLAdapter>()
+            .await;
+
+        let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+        eventually! {
+            let rows: Vec<mysql_async::Row> = rs_conn.query("SHOW READYSET STATUS").await.unwrap();
+            rows.iter().any(|r| r.get::<String, _>(1).as_deref() == Some("Online"))
+        }
+
+        rs_conn
+            .query_drop("CREATE CACHE kept WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = ? AND status = 'active'")
+            .await
+            .unwrap();
+
+        let result: Vec<i32> = eventually_readyset(
+            &mut rs_conn,
+            "SELECT v FROM t WHERE id = 1 AND status = 'active'",
+            QueryDestination::Readyset(Some("kept".into())),
+        )
+        .await;
+        assert_eq!(result, vec![10]);
+
+        drop(rs_conn);
+        shutdown_tx.shutdown().await;
+    }
+
+    eventually! {
+        Arc::strong_count(&first_authority) == 1
+    }
+    drop(first_authority);
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .authority(new_authority())
+        .durability_mode(DurabilityMode::Permanent)
+        .storage_dir_path(storage_dir.path().to_path_buf())
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .migration_style(MigrationStyle::Explicit)
+        .replicate_db(db_name)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+    eventually! {
+        let caches: Vec<mysql_async::Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+        !caches.is_empty()
+    }
+
+    // Present is not enough: the read has to reach it. The views synchronizer has to promote
+    // the recovered form's status first, once it sees the server's view for it.
+    eventually!(run_test: {
+        let rows: Vec<i32> = rs_conn
+            .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
+            .await
+            .unwrap();
+        let info: QueryInfo = rs_conn
+            .query_first("EXPLAIN LAST STATEMENT")
+            .await
+            .unwrap()
+            .unwrap();
+        (rows, info.destination)
+    }, then_assert: |(rows, destination)| {
+        assert_eq!(rows, vec![10]);
+        assert_eq!(destination, QueryDestination::Readyset(Some("kept".into())));
+    });
+    shutdown_tx.shutdown().await;
+}
+
+/// Rows enough that every limit in the TopK tests is a real bound: three per status, ordered by
+/// `v`, and a `pending` row so a read that matches no cache still proves the upstream answered.
 const TK: &str = "CREATE TABLE t (id int, status varchar(16), v int); \
                   INSERT INTO t (id, status, v) VALUES \
                   (1, 'active', 10), (2, 'active', 30), (3, 'active', 50), \
@@ -941,21 +1131,22 @@ async fn a_topk_read_reaches_the_cache_that_kept_its_limit() {
         )
         .await
         .unwrap();
-    sleep().await;
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2",
+        QueryDestination::Readyset(Some("lit".into())),
+    )
+    .await;
     assert_eq!(rows, vec![10, 30]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lit".into()))).await;
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 1")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 1",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -978,43 +1169,48 @@ async fn a_literal_limit_read_reaches_a_cache_with_a_placeholder_limit() {
         )
         .await
         .unwrap();
-    sleep().await;
 
     let served = QueryDestination::Readyset(Some("par".into()));
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1",
+        served.clone(),
+    )
+    .await;
     assert_eq!(rows, vec![20]);
-    assert_last_target_was(&mut rs_conn, served.clone()).await;
 
     // Another limit is the same query to this cache: the read's own limit bounds it.
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2")
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2",
+        served,
+    )
+    .await;
     assert_eq!(rows, vec![20, 40]);
-    assert_last_target_was(&mut rs_conn, served).await;
 
     // The second attempt lands on the shape the cache is filed under, but the literal it kept
     // still decides: a different value there is a different query.
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'pending' ORDER BY v LIMIT 1")
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'pending' ORDER BY v LIMIT 1",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert_eq!(rows, vec![70]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     // Dropping the cache takes the second attempt's target with it.
     rs_conn.query_drop("DROP CACHE par").await.unwrap();
-    sleep().await;
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1")
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert_eq!(rows, vec![20]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -1044,30 +1240,32 @@ async fn a_read_prefers_the_cache_that_kept_its_exact_limit() {
         )
         .await
         .unwrap();
-    sleep().await;
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2",
+        QueryDestination::Readyset(Some("lit2".into())),
+    )
+    .await;
     assert_eq!(rows, vec![20, 40]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lit2".into()))).await;
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1",
+        QueryDestination::Readyset(Some("par".into())),
+    )
+    .await;
     assert_eq!(rows, vec![20]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("par".into()))).await;
 
     rs_conn.query_drop("DROP CACHE lit2").await.unwrap();
-    sleep().await;
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2")
-        .await
-        .unwrap();
+
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2",
+        QueryDestination::Readyset(Some("par".into())),
+    )
+    .await;
     assert_eq!(rows, vec![20, 40]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("par".into()))).await;
 
     shutdown_tx.shutdown().await;
 }
@@ -1089,15 +1287,15 @@ async fn an_orderless_limit_read_takes_one_shape() {
         )
         .await
         .unwrap();
-    sleep().await;
 
-    let rows: Vec<i32> = rs_conn
-        .query("SELECT v FROM t WHERE status = 'archived' LIMIT 1")
-        .await
-        .unwrap();
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        "SELECT v FROM t WHERE status = 'archived' LIMIT 1",
+        QueryDestination::Upstream,
+    )
+    .await;
     assert_eq!(rows.len(), 1);
     assert!([20, 40, 60].contains(&rows[0]), "an archived row, from upstream: {rows:?}");
-    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;
 }

@@ -107,11 +107,15 @@ use readyset_schema::{ReadysetSchema, ReadysetSchemaSession};
 use readyset_shallow::{CacheInfo, CacheInsertGuard, CacheManager, ContentHash};
 use readyset_sql::ast::{
     self, CacheInner, CacheType, CreateCacheOptions, CreateCacheStatement, ReadysetHintDirective,
-    Relation, ShallowCacheQuery, SqlIdentifier, SqlQuery, TrxCachePolicy, UseStatement,
+    Relation, SelectStatement, ShallowCacheQuery, SqlIdentifier, SqlQuery, TrxCachePolicy,
+    UseStatement,
 };
 use readyset_sql::{Dialect, DialectDisplay, TryFromDialect};
 use readyset_sql_parsing::ParsingPreset;
-use readyset_sql_passes::adapter_rewrites::{AdapterRewriteParams, ShallowQueryParameters};
+use readyset_sql_passes::adapter_rewrites::{
+    self, AdapterRewriteContext, AdapterRewriteParams, DfQueryParameters, LiteralSlots,
+    ShallowQueryParameters,
+};
 use readyset_sql_passes::detect_references::{references_schema, references_variables};
 use readyset_sql_passes::shallow::{
     ShallowCacheAllowlists, ShallowCacheEligibility, rewrite_shallow,
@@ -2407,6 +2411,254 @@ enum RecoveryOutcome {
     /// Recovery is permanently impossible — the analyzer Refused,
     /// or the parsed statement is non-recoverable. DDL is dropped.
     Skipped { reason: String },
+}
+
+/// A cache that keeps its author's literals inline, and what a read needs to reach it.
+///
+/// Such a cache takes a form no read produces on its own, so it is filed under the shape a read
+/// does hash to, and a read that carries the literals in [`Self::slots`] is served from the form
+/// and parameters here.
+#[derive(Debug)]
+pub(crate) struct InlineLiteralRegistration {
+    /// The canonical shape a read hashes to.
+    pub shape: QueryId,
+    /// What the cache holds at each of that shape's parameter positions.
+    pub slots: LiteralSlots,
+    /// The cache's own form.
+    pub request: ViewCreateRequest,
+    /// Its parameters, whose values a matching read replaces with its own.
+    pub params: DfQueryParameters,
+}
+
+/// The form a cache takes, and the registration it owes the read path when it keeps its author's
+/// literals inline.
+///
+/// Creating a cache and recovering one after a restart both derive this the same way from the same
+/// statement, which is what makes a recovered cache reachable by the reads the created one was.
+pub(crate) fn inline_literal_cache_form<C: AdapterRewriteContext + Copy>(
+    stmt: &SelectStatement,
+    rewrite_params: AdapterRewriteParams,
+    context: C,
+    search_path: Vec<SqlIdentifier>,
+) -> ReadySetResult<(ViewCreateRequest, Option<InlineLiteralRegistration>)> {
+    // The shape a read hashes to, and what this statement holds at its positions. Both come from
+    // the form that parameterizes everything, whatever this deployment's default is.
+    let shape = if rewrite_params.autoparameterize {
+        None
+    } else {
+        let mut canonical_params = rewrite_params;
+        canonical_params.autoparameterize = true;
+        let mut shape = stmt.clone();
+        let canonical = adapter_rewrites::rewrite_query(&mut shape, canonical_params, context)?;
+        // A statement whose every literal became a parameter anyway takes the form a read
+        // produces on its own, so it needs no entry to be reached through.
+        (canonical.slots().inline_positions() > 0).then(|| {
+            (
+                QueryId::from_select(&shape, &search_path),
+                canonical.slots().clone(),
+            )
+        })
+    };
+
+    let mut form = stmt.clone();
+    let params = adapter_rewrites::rewrite_query(&mut form, rewrite_params, context)?;
+    let request = ViewCreateRequest::new(form, search_path);
+    let registration = shape.map(|(shape, slots)| InlineLiteralRegistration {
+        shape,
+        slots,
+        request: request.clone(),
+        params,
+    });
+    Ok((request, registration))
+}
+
+/// Register every cache that keeps its author's literals inline and predates this process, from
+/// the same persisted DDL the controller replays.
+///
+/// A statement naming a relation the catalog has not caught up to is retried on the schedule a
+/// deferred shallow cache uses. Until it is registered, such a cache is unreachable by an ad-hoc
+/// read, which is what not recovering at all would leave.
+pub async fn recreate_inline_literal_caches(
+    query_status_cache: &'static QueryStatusCache,
+    schema_handle: SchemaCatalogHandle,
+    ddl_requests: Vec<CacheDDLRequest>,
+    parsing_preset: ParsingPreset,
+    rewrite_params: AdapterRewriteParams,
+) -> ReadySetResult<()> {
+    let (recovered, deferred) = match schema_handle.get_catalog_retrying().await {
+        // Rewriting every persisted statement twice is heavy enough to keep off the reactor.
+        Ok(catalog) => tokio::task::spawn_blocking(move || {
+            let mut recovered = 0usize;
+            let mut deferred = Vec::new();
+            for req in ddl_requests {
+                match recover_inline_literal_cache(
+                    query_status_cache,
+                    parsing_preset,
+                    rewrite_params,
+                    &catalog,
+                    &req,
+                ) {
+                    Ok(true) => recovered += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            statement = %Sensitive(&req.unparsed_stmt),
+                            "deferring a cache until the catalog catches up"
+                        );
+                        deferred.push(req);
+                    }
+                }
+            }
+            (recovered, deferred)
+        })
+        .await
+        .map_err(|error| internal_err!("recovering inline-literal caches panicked: {error}"))?,
+        // No catalog to resolve against yet, so every statement waits for the retry rather than
+        // none of them being recovered before the next restart.
+        Err(error) => {
+            warn!(%error, "schema catalog not available yet; deferring every cache");
+            (0, ddl_requests)
+        }
+    };
+
+    if recovered > 0 {
+        info!(
+            recovered,
+            "recovered caches that keep their literals inline"
+        );
+    }
+    if !deferred.is_empty() {
+        tokio::spawn(retry_deferred_inline_literal_caches(
+            query_status_cache,
+            schema_handle,
+            deferred,
+            parsing_preset,
+            rewrite_params,
+        ));
+    }
+    Ok(())
+}
+
+/// Register one persisted cache, reporting whether it had anything to register.
+fn recover_inline_literal_cache(
+    query_status_cache: &'static QueryStatusCache,
+    parsing_preset: ParsingPreset,
+    rewrite_params: AdapterRewriteParams,
+    catalog: &Arc<schema_catalog::SchemaCatalog>,
+    req: &CacheDDLRequest,
+) -> ReadySetResult<bool> {
+    let context = RewriteContext::new(req.dialect, catalog.clone(), req.schema_search_path.clone());
+    let parsed = readyset_sql_parsing::parse_query_with_config(
+        parsing_preset,
+        req.dialect.into(),
+        &req.unparsed_stmt,
+    )?;
+    // The persisted set is a log the controller replays in order, so a DROP marker in it cancels
+    // an earlier CREATE. Give up the name's claim rather than re-register a cache that will not
+    // be rebuilt.
+    if let SqlQuery::DropCache(drop_cache) = &parsed {
+        query_status_cache.remove_inline_literal_cache_by_name(&drop_cache.name);
+        return Ok(false);
+    }
+    // The set also holds shallow caches, which keep no literals inline.
+    let SqlQuery::CreateCache(create) = parsed else {
+        return Ok(false);
+    };
+    if create.cache_type == Some(CacheType::Shallow) {
+        return Ok(false);
+    }
+    let CacheInner::Statement { deep, .. } = create.inner else {
+        // An id was resolved to a statement before the request was persisted.
+        return Ok(false);
+    };
+    // The statement the authority persisted carries the option, so recovery reproduces what the
+    // cache was created with.
+    let mut rewrite_params = rewrite_params;
+    rewrite_params.autoparameterize = create.autoparam.autoparameterize();
+    // Such a cache is reached by the shape a read hashes to on its own, so recovery has nothing
+    // to file for it and no reason to rewrite it.
+    if rewrite_params.autoparameterize {
+        return Ok(false);
+    }
+    let stmt = deep.map_err(ReadySetError::UnparseableQuery)?;
+
+    let (_, registration) = inline_literal_cache_form(
+        &stmt,
+        rewrite_params,
+        &context,
+        req.schema_search_path.clone(),
+    )?;
+    let Some(registration) = registration else {
+        return Ok(false);
+    };
+    // An unnamed cache took the query id of its own form as its name.
+    let name = create
+        .name
+        .clone()
+        .or_else(|| req.cache_name.clone())
+        .unwrap_or_else(|| QueryId::from(&registration.request).into());
+    query_status_cache.register_inline_literal_cache(
+        registration.shape,
+        name,
+        registration.slots,
+        registration.request,
+        registration.params,
+        create.trx_cache_policy,
+    )?;
+    Ok(true)
+}
+
+/// Retry the caches that could not be recovered at startup, on the schedule deferred shallow
+/// caches use.
+async fn retry_deferred_inline_literal_caches(
+    query_status_cache: &'static QueryStatusCache,
+    schema_handle: SchemaCatalogHandle,
+    mut pending: Vec<CacheDDLRequest>,
+    parsing_preset: ParsingPreset,
+    rewrite_params: AdapterRewriteParams,
+) {
+    for _ in 1..=RECOVERY_RETRY_MAX_ATTEMPTS {
+        tokio::time::sleep(RECOVERY_RETRY_INTERVAL).await;
+        if pending.is_empty() {
+            return;
+        }
+        let Ok(catalog) = schema_handle.get_catalog_retrying().await else {
+            continue;
+        };
+        // Rewriting is as heavy here as it is at startup, so it stays off the reactor too.
+        let batch = std::mem::take(&mut pending);
+        pending = match tokio::task::spawn_blocking(move || {
+            let mut still_pending = Vec::new();
+            for req in batch {
+                if let Err(error) = recover_inline_literal_cache(
+                    query_status_cache,
+                    parsing_preset,
+                    rewrite_params,
+                    &catalog,
+                    &req,
+                ) {
+                    debug!(%error, statement = %Sensitive(&req.unparsed_stmt), "cache still deferred");
+                    still_pending.push(req);
+                }
+            }
+            still_pending
+        })
+        .await
+        {
+            Ok(still_pending) => still_pending,
+            Err(error) => {
+                warn!(%error, "recovering inline-literal caches panicked; giving up the retry");
+                return;
+            }
+        };
+    }
+    for req in &pending {
+        warn!(
+            statement = %Sensitive(&req.unparsed_stmt),
+            "gave up recovering a cache; its ad-hoc reads go upstream until a restart"
+        );
+    }
 }
 
 /// Recreate shallow caches from stored DDL requests on adapter
