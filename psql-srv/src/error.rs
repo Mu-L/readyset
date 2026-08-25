@@ -46,6 +46,9 @@ pub enum Error {
     #[error("parse error: {0}")]
     ParseError(String),
 
+    #[error("transient error: {0}")]
+    TransientError(String),
+
     #[error("unexpected message: {0}")]
     UnexpectedMessage(String),
 
@@ -133,6 +136,7 @@ impl From<Error> for BackendMessage {
                 SqlState::UNDEFINED_PSTATEMENT
             }
             Error::ParseError(_) => SqlState::INVALID_PSTATEMENT_DEFINITION,
+            Error::TransientError(_) => SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
             Error::Unimplemented(_)
             | Error::Unsupported(_)
             | Error::UnsupportedMessage(_)
