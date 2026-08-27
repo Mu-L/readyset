@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{io, mem};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, Context, Error};
 use itertools::Itertools;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
@@ -16,7 +16,9 @@ use tracing::{debug, info, warn};
 use tracing::error;
 
 use database_utils::tls::ServerCertVerification;
-use database_utils::{DatabaseConnection, DatabaseType, DatabaseURL, QueryableConnection};
+use database_utils::{
+    DatabaseConnection, DatabaseError, DatabaseType, DatabaseURL, QueryableConnection,
+};
 use readyset_client_metrics::QueryDestination;
 use readyset_data::{Collation, DfType, DfValue};
 use readyset_sql_parsing::ParsingPreset;
@@ -214,7 +216,7 @@ fn rows_from_results(results: database_utils::QueryResults) -> anyhow::Result<Ve
             .into_iter()
             .map(|row| {
                 (0..row.len())
-                    .map(|i| row.try_get(i).map_err(anyhow::Error::from))
+                    .map(|i| row.try_get(i).map_err(Error::from))
                     .collect::<anyhow::Result<Vec<_>>>()
             })
             .collect(),
@@ -261,6 +263,36 @@ pub(crate) async fn recreate_test_database(url: &DatabaseURL) -> anyhow::Result<
     Ok(())
 }
 
+enum QueryOutcome {
+    Pass,
+    Fail(Error),
+    Retry(Error),
+}
+
+fn is_retryable(err: &Error) -> bool {
+    for cause in err.chain() {
+        if let Some(err) = cause.downcast_ref::<DatabaseError>() {
+            return match err {
+                DatabaseError::MySQL(mysql_async::Error::Server(err)) => matches!(
+                    mysql_srv::ErrorKind::from(err.code),
+                    mysql_srv::ErrorKind::ER_QUERY_INTERRUPTED
+                        | mysql_srv::ErrorKind::ER_NO_SUCH_TABLE
+                ),
+                DatabaseError::PostgreSQL(err) => match err.as_db_error() {
+                    Some(err) => matches!(
+                        *err.code(),
+                        tokio_postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+                            | tokio_postgres::error::SqlState::UNDEFINED_TABLE
+                    ),
+                    None => true,
+                },
+                _ => true,
+            };
+        }
+    }
+    true
+}
+
 /// If `pattern` is non-empty, compile it as a regex and verify that `error` matches it.
 /// Returns `Ok(())` if the pattern is empty or matches; returns an error otherwise.
 fn check_error_pattern(error: &dyn Display, pattern: &str) -> anyhow::Result<()> {
@@ -279,7 +311,7 @@ fn check_error_pattern(error: &dyn Display, pattern: &str) -> anyhow::Result<()>
 /// This walks the chain to the deepest cause and returns its `Display` output,
 /// which is the actual error message without any wrapping context (like
 /// "Running query ..." or "Query failed after N retries").
-fn root_cause_message(err: &anyhow::Error) -> String {
+fn root_cause_message(err: &Error) -> String {
     err.root_cause().to_string()
 }
 
@@ -521,14 +553,21 @@ impl TestScript {
                     debug!(command = stmt.command, "Running statement");
                     let stmt_result = retry_with_exponential_backoff!(
                         {
-                        self.run_statement(stmt, conn, opts.query_timeout, is_readyset, false)
-                            .await
-                            .with_context(|| format!("Running statement {}", stmt.command))
+                            match self
+                                .run_statement(stmt, conn, opts.query_timeout, is_readyset, false)
+                                .await
+                                .with_context(|| format!("Running statement {}", stmt.command))
+                            {
+                                Ok(()) => Ok(Ok(())),
+                                Err(e) if is_retryable(&e) => Err(e),
+                                Err(e) => Ok(Err(e)),
+                            }
                         },
                         retries: retries,
                         delay: 100,
                         backoff: 2,
                     )
+                    .and_then(|result| result)
                     .with_context(|| {
                         if *line_num > 0 {
                             format!("Running statement at line {line_num} with {retries} retries")
@@ -581,23 +620,25 @@ impl TestScript {
                     // 25.5 seconds total
                     let query_result = retry_with_exponential_backoff!(
                         {
-                                let query_result = self
-                                    .run_query(query, conn, is_readyset, opts)
-                                    .await
-                                    .with_context(|| format!("Running query {}", query.query));
-
-                                match (query_result, invert_result) {
-                                    (Ok(_), true) => {
-                                        Err(anyhow!("Expected failure: {}", query.query))
-                                    }
-                                    (Err(e), false) => Err(e),
-                                    _ => Ok(()),
+                            let outcome = self.run_query(query, conn, is_readyset, opts).await;
+                            match (outcome, invert_result) {
+                                (QueryOutcome::Pass, true) => {
+                                    Err(anyhow!("Expected failure: {}", query.query))
                                 }
+                                (QueryOutcome::Pass, false) => Ok(Ok(())),
+                                (QueryOutcome::Retry(e), false) => Err(e),
+                                (QueryOutcome::Fail(e), false) => Ok(Err(e)),
+                                (QueryOutcome::Retry(..) | QueryOutcome::Fail(..), true) => {
+                                    Ok(Ok(()))
+                                }
+                            }
                         },
                         retries: retries,
                         delay: 100,
                         backoff: 2,
-                    );
+                    )
+                    .and_then(|result| result)
+                    .with_context(|| format!("Running query {}", query.query));
 
                     match query_result {
                         Ok(_) => {
@@ -719,7 +760,7 @@ impl TestScript {
         match stmt.result {
             StatementResult::Ok => {
                 if let Err(e) = res {
-                    bail!("Statement failed: {}", e);
+                    return Err(Error::new(e).context("Statement failed"));
                 }
             }
             StatementResult::Error { ref pattern } => match res {
@@ -798,28 +839,28 @@ impl TestScript {
         conn: &mut DatabaseConnection,
         is_readyset: bool,
         opts: &RunOptions,
-    ) -> anyhow::Result<()> {
+    ) -> QueryOutcome {
         let result = self.run_query_inner(query, conn, is_readyset, opts).await;
 
-        if opts.ignore_error_tags {
-            return result;
-        }
-
-        if let Some(error_pattern) = &query.expected_error {
-            match result {
-                Err(e) => {
-                    check_error_pattern(&e, error_pattern)?;
-                    Ok(())
-                }
-                Ok(()) => {
-                    bail!(
-                        "Expected query to error, but it succeeded \
-                         (if the bug is fixed, remove the `error` tag)"
-                    )
-                }
-            }
+        let expected_error = if opts.ignore_error_tags {
+            None
         } else {
-            result
+            query.expected_error.as_ref()
+        };
+
+        match (result, expected_error) {
+            (Ok(()), None) => QueryOutcome::Pass,
+            (Ok(()), Some(_)) => QueryOutcome::Fail(anyhow!(
+                "Expected query to error, but it succeeded \
+                 (if the bug is fixed, remove the `error` tag)"
+            )),
+            (Err(e), None) if is_retryable(&e) => QueryOutcome::Retry(e),
+            (Err(e), None) => QueryOutcome::Fail(e),
+            (Err(e), Some(pattern)) => match check_error_pattern(&e, pattern) {
+                Ok(()) => QueryOutcome::Pass,
+                Err(mismatch) if is_retryable(&e) => QueryOutcome::Retry(mismatch),
+                Err(mismatch) => QueryOutcome::Fail(mismatch),
+            },
         }
     }
 
