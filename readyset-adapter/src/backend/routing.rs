@@ -7,6 +7,7 @@
 //! database type.
 
 use std::mem;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use metrics::counter;
@@ -542,6 +543,15 @@ impl<'session> SelectRouter<'session> {
     ) -> ShouldTrySelect {
         match adapter_rewrites::rewrite_for_readyset(&mut q.statement, rewrite_params, params) {
             Ok(params) => {
+                // The finished form is the shape a cache keeping its literals inline is filed
+                // under. On a hit the cache's own form, already finished, takes the read's place.
+                let params = match inline_literal_cache_for(self.query_status_cache, q, &params) {
+                    Some((request, params)) => {
+                        *q = request;
+                        params
+                    }
+                    None => params,
+                };
                 let status = self.query_status_cache.query_status(q, schema_generation);
                 let has_deep_cache = matches!(
                     status.migration_state,
@@ -596,6 +606,37 @@ fn has_topk_literal_limit(statement: &SelectStatement) -> bool {
                     | readyset_sql::ast::Literal::UnsignedInteger(_)
             )
         )
+}
+
+/// The cache keeping its author's literals inline that a finished read belongs to, if any, and
+/// that cache's parameters carrying the read's own values.
+fn inline_literal_cache_for(
+    query_status_cache: &QueryStatusCache,
+    shape: &ViewCreateRequest,
+    read_params: &DfQueryParameters,
+) -> Option<(ViewCreateRequest, DfQueryParameters)> {
+    if !query_status_cache.may_have_inline_literal_caches() {
+        return None;
+    }
+    let matched = query_status_cache.match_inline_literal_cache(
+        &QueryId::from_select(&shape.statement, &shape.schema_search_path),
+        read_params.slots(),
+    );
+    // A miss is how a read whose literals no cache kept reaches the upstream, so from outside it
+    // is indistinguishable from the feature being broken.
+    counter!(
+        metric::INLINE_LITERAL_CACHE_LOOKUPS,
+        "result" => if matched.is_some() { "hit" } else { "miss" },
+    )
+    .increment(1);
+    // Taken from the registry as shared handles, so the copies a hit needs are made here rather
+    // than under the map's guard.
+    matched.map(|(request, cache_params, lookup)| {
+        (
+            Arc::unwrap_or_clone(request),
+            Arc::unwrap_or_clone(cache_params).for_read(read_params, lookup),
+        )
+    })
 }
 
 #[cfg(test)]

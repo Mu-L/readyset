@@ -17,3 +17,8 @@ pub const QUERY_STATUS_CACHE_STATUSES_SIZE: &str = "readyset_query_status_cache_
 /// Gauge: The size of the query status cache's pending inlined migrations
 pub const QUERY_STATUS_CACHE_PENDING_INLINE_MIGRATIONS: &str =
     "readyset_query_status_cache_pending_inline_migrations";
+
+/// Counter: Lookups of a cache that keeps its author's literals inline, labelled `result` with
+/// `hit` or `miss`. A read whose literals no cache kept is served upstream, so a mode that works
+/// and one that never matches look alike without this.
+pub const INLINE_LITERAL_CACHE_LOOKUPS: &str = "readyset_inline_literal_cache_lookups";

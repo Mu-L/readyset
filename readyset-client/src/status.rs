@@ -152,6 +152,7 @@ pub struct CacheProperties {
     schedule: bool,
     adaptive: bool,
     topk_buffer_multiplier: Option<usize>,
+    keeps_literals_inline: Option<bool>,
 }
 
 impl Display for CacheProperties {
@@ -180,6 +181,12 @@ impl Display for CacheProperties {
         if let Some(m) = self.topk_buffer_multiplier {
             properties.push(Cow::Owned(format!("topk buffer ×{m}")));
         }
+        match self.keeps_literals_inline {
+            Some(true) => properties.push(Cow::Borrowed("autoparam off")),
+            Some(false) => properties.push(Cow::Borrowed("autoparam on")),
+            // Not a property a shallow cache has.
+            None => {}
+        }
         write!(f, "{}", properties.join(", "))
     }
 }
@@ -195,6 +202,7 @@ impl CacheProperties {
             schedule: false,
             adaptive: false,
             topk_buffer_multiplier: None,
+            keeps_literals_inline: None,
         }
     }
 
@@ -224,5 +232,11 @@ impl CacheProperties {
 
     pub fn set_topk_buffer_multiplier(&mut self, multiplier: usize) {
         self.topk_buffer_multiplier = Some(multiplier);
+    }
+
+    /// Say whether this cache keeps some of its author's literals inline. One that does is
+    /// reached by a read carrying those same literals rather than by producing the cache's form.
+    pub fn set_keeps_literals_inline(&mut self, keeps: bool) {
+        self.keeps_literals_inline = Some(keeps);
     }
 }

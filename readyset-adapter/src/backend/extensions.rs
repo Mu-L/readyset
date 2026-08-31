@@ -38,6 +38,7 @@ use readyset_sql::ast::{
     ModifyUserStatement, ProxiedQueriesOptions, Relation, ShallowCacheAllowlistChange,
     ShallowCacheAllowlistKind, ShowStatement, SqlQuery, TrxCachePolicy,
 };
+use readyset_sql_passes::adapter_rewrites::{DfQueryParameters, LiteralSlots};
 use readyset_sql_passes::shallow::rewrite_shallow;
 use readyset_sql_passes::{DetectBucketFunctions, adapter_rewrites};
 use readyset_telemetry_reporter::TelemetryEvent;
@@ -56,6 +57,21 @@ use super::{
 use crate::cache_acl::{AclMessage, CacheCreator, PassTrigger};
 use crate::utils::create_dummy_column;
 use crate::{QueryHandler, UpstreamDatabase, create_dummy_schema};
+
+/// A cache that keeps its author's literals inline, waiting on the cache itself being created.
+///
+/// A read reaches such a cache by matching what it carries against [`Self::slots`], and is then
+/// served from the form and parameters registered here rather than from a rewrite of its own.
+struct InlineLiteralRegistration {
+    /// The canonical shape a read hashes to, which is what the cache is filed under.
+    shape: QueryId,
+    /// What the cache holds at each of that shape's parameter positions.
+    slots: LiteralSlots,
+    /// The cache's own form.
+    request: ViewCreateRequest,
+    /// Its parameters, whose values a matching read replaces with its own.
+    params: DfQueryParameters,
+}
 
 impl<DB, Handler> Backend<DB, Handler>
 where
@@ -481,11 +497,13 @@ where
         ReadySetResult<ViewCreateRequest>,
         ReadySetResult<ShallowViewRequest>,
         SchemaGeneration,
+        Option<InlineLiteralRegistration>,
     )> {
         match inner {
             CacheInner::Statement { deep, shallow } => {
                 let deep = deep.clone();
                 let shallow = shallow.clone();
+                let mut registration = None;
 
                 // Rewrite for deep.
                 let rewrite_context =
@@ -521,17 +539,53 @@ where
                         ));
                     }
                     match deep {
-                        Ok(mut deep) => match adapter_rewrites::rewrite_query(
-                            &mut deep,
-                            rewrite_params,
-                            &rewrite_context,
-                        ) {
-                            Ok(_params) => Ok(ViewCreateRequest::new(
-                                *deep,
-                                rewrite_context.search_path().to_owned(),
-                            )),
-                            Err(e) => Err(e),
-                        },
+                        Ok(mut deep) => {
+                            // The shape a read hashes to, and what this statement holds at its
+                            // positions. Both come from the form that parameterizes everything,
+                            // which the cache's own rewrite is about to depart from.
+                            let shape = (!rewrite_params.autoparameterize)
+                                .then(|| {
+                                    let mut params = rewrite_params;
+                                    params.autoparameterize = true;
+                                    let mut shape = (*deep).clone();
+                                    adapter_rewrites::rewrite_query(
+                                        &mut shape,
+                                        params,
+                                        &rewrite_context,
+                                    )
+                                    .map(|p| {
+                                        (
+                                            QueryId::from_select(
+                                                &shape,
+                                                rewrite_context.search_path(),
+                                            ),
+                                            p.slots().clone(),
+                                        )
+                                    })
+                                })
+                                .transpose()?;
+                            match adapter_rewrites::rewrite_query(
+                                &mut deep,
+                                rewrite_params,
+                                &rewrite_context,
+                            ) {
+                                Ok(params) => {
+                                    let request = ViewCreateRequest::new(
+                                        *deep,
+                                        rewrite_context.search_path().to_owned(),
+                                    );
+                                    registration =
+                                        shape.map(|(shape, slots)| InlineLiteralRegistration {
+                                            shape,
+                                            slots,
+                                            request: request.clone(),
+                                            params,
+                                        });
+                                    Ok(request)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
                         Err(e) => Err(ReadySetError::UnparseableQuery(e)),
                     }
                 };
@@ -551,7 +605,7 @@ where
                     Err(e) => Err(ReadySetError::UnparseableQuery(e)),
                 };
 
-                Ok((deep, shallow, schema_generation))
+                Ok((deep, shallow, schema_generation, registration))
             }
             CacheInner::Id(id) => {
                 // A query reaches the status cache already rewritten, so by the time it has an id
@@ -578,6 +632,7 @@ where
                                 Ok((*deep).clone()),
                                 Err(ReadySetError::NoQueryForId { id: id.to_string() }),
                                 generation,
+                                None,
                             ))
                         }
                         Query::ShallowParsed(shallow) => {
@@ -589,6 +644,7 @@ where
                                 Err(ReadySetError::NoQueryForId { id: id.to_string() }),
                                 Ok((*shallow).clone()),
                                 generation,
+                                None,
                             ))
                         }
                         Query::ParseFailed(_, e) => Err(ReadySetError::UnparseableQuery(e)),
@@ -614,7 +670,10 @@ where
             internal!("Unexpected EXPLAIN: {explain:?}");
         };
 
-        Self::query_from_cache_inner(connectors, settings, state, inner, Default::default()).await
+        let (deep, shallow, schema_generation, _) =
+            Self::query_from_cache_inner(connectors, settings, state, inner, Default::default())
+                .await?;
+        Ok((deep, shallow, schema_generation))
     }
 
     // Determine the migration state of the deep representation, performing a dry run if necessary.
@@ -823,6 +882,11 @@ where
         if let Some(view_request) = maybe_view_request {
             state.drop_view_request(&view_request);
         }
+        // A cache reached through what a read carries has to stop being reached once its view is
+        // gone, whether the drop came from DROP CACHE or from a new cache taking its name.
+        state
+            .query_status_cache
+            .remove_inline_literal_cache_by_name(name);
         Ok(noria_connector::QueryResult::Delete {
             num_rows_deleted: result,
         })
@@ -861,6 +925,7 @@ where
         if matches!(cache_type, Some(CacheType::Deep) | None) {
             state.authority.remove_all_cache_ddl_requests().await?;
             connectors.noria.drop_all_caches().await?;
+            state.query_status_cache.clear_inline_literal_caches();
         }
         if matches!(cache_type, Some(CacheType::Shallow) | None) {
             state
@@ -1109,6 +1174,9 @@ where
                     if let Some(m) = view.topk_buffer_multiplier {
                         properties.set_topk_buffer_multiplier(m);
                     }
+                    properties.set_keeps_literals_inline(
+                        state.query_status_cache.keeps_literals_inline(&view.name),
+                    );
                     properties.to_string().into()
                 };
                 let count = exec_counts
@@ -1580,7 +1648,7 @@ where
                     unsupported!("AUTOPARAM is not supported for SHALLOW caches");
                 }
 
-                let (deep, shallow, schema_generation) =
+                let (deep, shallow, schema_generation, registration) =
                     Self::query_from_cache_inner(connectors, settings, state, inner, *autoparam)
                         .await?;
 
@@ -1607,83 +1675,108 @@ where
                     None
                 };
 
-                if deep_requested || (cache_mode.is_deep() && !shallow_requested) {
-                    Self::create_deep_cache(
-                        connectors,
-                        settings,
-                        state,
-                        name.clone(),
-                        deep,
-                        shallow,
-                        *trx_cache_policy,
-                        *concurrently,
-                        *topk_buffer_multiplier,
-                        schema_generation,
-                        ddl_req,
-                        false,
-                    )
-                    .await
-                } else if shallow_requested || (cache_mode.is_shallow() && !deep_requested) {
-                    Self::create_shallow_cache(
-                        connectors,
-                        settings,
-                        state,
-                        name.clone(),
-                        deep,
-                        shallow,
-                        *policy,
-                        ddl_req,
-                        *trx_cache_policy,
-                        *coalesce_ms,
-                        *adaptive,
-                    )
-                    .await
-                } else {
-                    let res = Self::create_deep_cache(
-                        connectors,
-                        settings,
-                        state,
-                        name.clone(),
-                        deep.clone(),
-                        shallow.clone(),
-                        *trx_cache_policy,
-                        *concurrently,
-                        *topk_buffer_multiplier,
-                        schema_generation,
-                        ddl_req.clone(),
-                        true,
-                    )
-                    .await;
-                    match res {
-                        Ok(res) => Ok(res),
-                        Err(error) if error.is_transient() => {
-                            info!(%error, "Skipping CREATE CACHE due to transient error");
-                            Err(ReadySetError::CreateCacheError(format!(
-                                "Please retry due to transient error: {error}"
-                            )))
+                // Set by whichever branch builds a deep cache, so the registration below runs
+                // once for all of them.
+                let mut built_deep_cache = false;
+
+                let created_cache =
+                    if deep_requested || (cache_mode.is_deep() && !shallow_requested) {
+                        let created = Self::create_deep_cache(
+                            connectors,
+                            settings,
+                            state,
+                            name.clone(),
+                            deep,
+                            shallow,
+                            *trx_cache_policy,
+                            *concurrently,
+                            *topk_buffer_multiplier,
+                            schema_generation,
+                            ddl_req,
+                            false,
+                        )
+                        .await;
+                        built_deep_cache = created.is_ok();
+                        created
+                    } else if shallow_requested || (cache_mode.is_shallow() && !deep_requested) {
+                        Self::create_shallow_cache(
+                            connectors,
+                            settings,
+                            state,
+                            name.clone(),
+                            deep,
+                            shallow,
+                            *policy,
+                            ddl_req,
+                            *trx_cache_policy,
+                            *coalesce_ms,
+                            *adaptive,
+                        )
+                        .await
+                    } else {
+                        let res = Self::create_deep_cache(
+                            connectors,
+                            settings,
+                            state,
+                            name.clone(),
+                            deep.clone(),
+                            shallow.clone(),
+                            *trx_cache_policy,
+                            *concurrently,
+                            *topk_buffer_multiplier,
+                            schema_generation,
+                            ddl_req.clone(),
+                            true,
+                        )
+                        .await;
+                        built_deep_cache = res.is_ok();
+                        match res {
+                            Ok(res) => Ok(res),
+                            Err(error) if error.is_transient() => {
+                                info!(%error, "Skipping CREATE CACHE due to transient error");
+                                Err(ReadySetError::CreateCacheError(format!(
+                                    "Please retry due to transient error: {error}"
+                                )))
+                            }
+                            Err(error) => {
+                                info!(
+                                    %error,
+                                    "Deep cache creation failed; falling back to shallow cache"
+                                );
+                                Self::create_shallow_cache(
+                                    connectors,
+                                    settings,
+                                    state,
+                                    name.clone(),
+                                    deep,
+                                    shallow,
+                                    *policy,
+                                    ddl_req,
+                                    *trx_cache_policy,
+                                    *coalesce_ms,
+                                    *adaptive,
+                                )
+                                .await
+                            }
                         }
-                        Err(error) => {
-                            info!(
-                                %error,
-                                "Deep cache creation failed; falling back to shallow cache"
-                            );
-                            Self::create_shallow_cache(
-                                connectors,
-                                settings,
-                                state,
-                                name.clone(),
-                                deep,
-                                shallow,
-                                *policy,
-                                ddl_req,
-                                *trx_cache_policy,
-                                *coalesce_ms,
-                                *adaptive,
-                            )
-                            .await
-                        }
-                    }
+                    };
+
+                // A cache that keeps literals inline is reachable only through what a read
+                // carries, so register that once the cache itself exists. Both branches that
+                // build a deep cache reach here.
+                if built_deep_cache && let Some(registration) = registration {
+                    let name = name
+                        .clone()
+                        .unwrap_or_else(|| QueryId::from(&registration.request).into());
+                    state.query_status_cache.register_inline_literal_cache(
+                        registration.shape,
+                        name,
+                        registration.slots,
+                        registration.request,
+                        registration.params,
+                    );
                 }
+                created_cache
             }
             SqlQuery::DropCache(drop_cache) => {
                 if !settings.allow_cache_ddl {

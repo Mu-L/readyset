@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{self, AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -20,10 +21,13 @@ use readyset_client::query::*;
 use readyset_client::{ShallowViewRequest, ViewCreateRequest};
 use readyset_data::DfValue;
 use readyset_sql::ast::{CacheType, Relation, SqlIdentifier, TrxCachePolicy};
+use readyset_sql_passes::adapter_rewrites::{CacheLookupKey, DfQueryParameters, LiteralSlots};
 
 use schema_catalog::{SchemaChangeHandler, SchemaGeneration};
 
-use crate::table_extraction_visitor::extract_referenced_tables;
+use crate::table_extraction_visitor::{
+    extract_from_view_create_request, extract_referenced_tables,
+};
 
 pub const DEFAULT_QUERY_STATUS_CAPACITY: usize = 100_000;
 
@@ -75,6 +79,55 @@ pub struct QueryStatusCache {
     /// [`SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP`]; on overflow the map is bulk-
     /// cleared and a warning is logged.
     shallow_auto_create_skip: DashMap<QueryId, String, ahash::RandomState>,
+
+    /// The caches that keep some of their author's literals inline, indexed by the canonical
+    /// shape a read hashes to. One shape can hold several, since two caches differing only in a
+    /// literal share it.
+    ///
+    /// Such a cache takes a form no read produces on its own, so a read reaches it by matching
+    /// what it carries at each parameter position against what the cache does.
+    ///
+    /// The shape keying an entry comes from the catalog the cache was created against, so a
+    /// schema change can move it. Such a change also takes the status of every deep cache over
+    /// the tables it names, and an entry whose cache has no status routes nothing, so the two are
+    /// given up together -- see [`Self::remove_inline_literal_caches_referencing_tables`]. What
+    /// files an entry again is the persisted DDL, once the cache is recreated.
+    ///
+    /// Only a deep cache is ever registered here, which is what makes giving them up safe: a
+    /// shallow cache refreshes on its own TTL and nothing re-migrates it, so dropping its status
+    /// strands it (REA-6692).
+    inline_literal_caches: DashMap<QueryId, Vec<InlineLiteralCache>, ahash::RandomState>,
+
+    /// How many are registered, so a read in a deployment that uses none skips working its shape
+    /// out. Counted up before an entry appears and down after one is gone, so a reader seeing a
+    /// non-zero count may find nothing -- costing it only the lookup -- while one seeing zero can
+    /// be sure there is nothing to find.
+    inline_literal_caches_live: AtomicUsize,
+
+    /// Bumped whenever one is registered or forgotten, so a statement that planned against an
+    /// earlier value can tell that the set has moved without comparing it.
+    inline_literal_caches_generation: AtomicU64,
+}
+
+/// A cache that keeps some of its author's literals inline, and what a read needs to reach it.
+#[derive(Debug, Clone)]
+pub(crate) struct InlineLiteralCache {
+    /// What the cache holds at each canonical parameter position. A read whose own slots match
+    /// belongs to this cache; see [`LiteralSlots::match_read`].
+    pub(crate) slots: LiteralSlots,
+    /// The cache's own form, which a matching read is served from. It is kept because no read
+    /// produces this form, so there is nothing to derive it from later.
+    ///
+    /// Shared, so a lookup takes it while holding the map's guard and pays for a copy of it, if
+    /// it needs one at all, once the guard is gone.
+    pub(crate) request: Arc<ViewCreateRequest>,
+    /// The cache's parameters. Everything but the values they carry is a property of its form, so
+    /// a matching read substitutes only the literals its own positions hold. Shared for the same
+    /// reason as the form beside it.
+    pub(crate) params: Arc<DfQueryParameters>,
+    /// The caches registered here. Two agreeing on every position share the entry, which lives
+    /// as long as one of them does, so a DROP CACHE gives up only its own claim.
+    pub(crate) caches: HashSet<Relation>,
 }
 
 #[derive(Debug)]
@@ -337,6 +390,9 @@ impl QueryStatusCache {
             style: MigrationStyle::InRequestPath,
             placeholder_inlining: false,
             shallow_auto_create_skip: Default::default(),
+            inline_literal_caches: Default::default(),
+            inline_literal_caches_live: Default::default(),
+            inline_literal_caches_generation: Default::default(),
         }
     }
 
@@ -349,6 +405,9 @@ impl QueryStatusCache {
             style: MigrationStyle::InRequestPath,
             placeholder_inlining: false,
             shallow_auto_create_skip: Default::default(),
+            inline_literal_caches: Default::default(),
+            inline_literal_caches_live: Default::default(),
+            inline_literal_caches_generation: Default::default(),
         }
     }
 
@@ -376,6 +435,160 @@ impl QueryStatusCache {
         self.shallow_auto_create_skip.clear();
         gauge!(metric::SHALLOW_AUTO_CREATE_SKIP_SET_SIZE)
             .set(self.shallow_auto_create_skip.len() as f64);
+    }
+
+    /// Whether any cache keeping literals inline is registered, so a read can skip working its
+    /// own shape out where none is.
+    pub fn may_have_inline_literal_caches(&self) -> bool {
+        self.inline_literal_caches_live
+            .load(atomic::Ordering::Acquire)
+            > 0
+    }
+
+    /// How many times the set of caches keeping literals inline has changed. A statement holding
+    /// an earlier value was planned before some of them existed, so planning it again can reach a
+    /// cache it missed.
+    pub fn inline_literal_caches_generation(&self) -> u64 {
+        self.inline_literal_caches_generation
+            .load(atomic::Ordering::Acquire)
+    }
+
+    /// The form and parameters of the cache under `shape` that `read` belongs to, and what the
+    /// read carried at the positions that cache parameterized.
+    ///
+    /// Caches are tried most-specific first, so a read that could belong to two of them reaches
+    /// the same one every time. Only what serving the read needs is taken, leaving the matcher's
+    /// own slots and the names claiming the entry behind.
+    pub fn match_inline_literal_cache(
+        &self,
+        shape: &QueryId,
+        read: &LiteralSlots,
+    ) -> Option<(
+        Arc<ViewCreateRequest>,
+        Arc<DfQueryParameters>,
+        CacheLookupKey,
+    )> {
+        let caches = self.inline_literal_caches.get(shape)?;
+        caches.value().iter().find_map(|cache| {
+            let matched = cache.slots.match_read(read)?;
+            Some((cache.request.clone(), cache.params.clone(), matched))
+        })
+    }
+
+    /// Register a cache that keeps literals inline. A cache agreeing with one already registered
+    /// on every position joins it rather than adding an entry of its own.
+    pub fn register_inline_literal_cache(
+        &self,
+        shape: QueryId,
+        name: Relation,
+        slots: LiteralSlots,
+        request: ViewCreateRequest,
+        params: DfQueryParameters,
+    ) {
+        let mut caches = self.inline_literal_caches.entry(shape).or_default();
+        match caches.iter_mut().find(|cache| cache.slots == slots) {
+            Some(cache) => {
+                cache.caches.insert(name);
+            }
+            None => {
+                self.inline_literal_caches_live
+                    .fetch_add(1, atomic::Ordering::Release);
+                self.inline_literal_caches_generation
+                    .fetch_add(1, atomic::Ordering::Release);
+                caches.push(InlineLiteralCache {
+                    slots,
+                    request: Arc::new(request),
+                    params: Arc::new(params),
+                    caches: HashSet::from([name]),
+                });
+                // A read tries these in order, so the one holding the most literals wins a read
+                // that could belong to two of them. The slots break a tie, which keeps the winner
+                // the same across restarts, where these are registered in recovery order.
+                caches.sort_by(|a, b| {
+                    b.slots
+                        .inline_positions()
+                        .cmp(&a.slots.inline_positions())
+                        .then_with(|| a.slots.cmp(&b.slots))
+                });
+            }
+        }
+    }
+
+    /// Whether the cache called `name` keeps some of its author's literals inline.
+    pub fn keeps_literals_inline(&self, name: &Relation) -> bool {
+        self.may_have_inline_literal_caches()
+            && self.inline_literal_caches.iter().any(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .any(|cache| cache.caches.contains(name))
+            })
+    }
+
+    /// Give up `name`'s claim, forgetting a cache no name claims any more. Used by DROP CACHE.
+    pub fn remove_inline_literal_cache_by_name(&self, name: &Relation) {
+        if !self.may_have_inline_literal_caches() {
+            return;
+        }
+        // `retain` can drop several entries in one pass, so count what actually went.
+        let mut gone = 0;
+        self.inline_literal_caches.retain(|_, caches| {
+            caches.retain_mut(|cache| {
+                cache.caches.remove(name);
+                let claimed = !cache.caches.is_empty();
+                gone += usize::from(!claimed);
+                claimed
+            });
+            !caches.is_empty()
+        });
+        if gone > 0 {
+            self.inline_literal_caches_live
+                .fetch_sub(gone, atomic::Ordering::Release);
+            self.inline_literal_caches_generation
+                .fetch_add(1, atomic::Ordering::Release);
+        }
+    }
+
+    /// Forget every entry whose cache reads from one of `tables`.
+    ///
+    /// A schema change takes the statuses of the caches over those tables with it, and an entry
+    /// whose cache has no status routes nothing, so the two are given up together. Matching is by
+    /// name, as the status invalidation beside it is: an entry kept for a cache whose status is
+    /// gone would hold a shape no read can be served from.
+    pub fn remove_inline_literal_caches_referencing_tables(&self, tables: &[Relation]) {
+        if tables.is_empty() || !self.may_have_inline_literal_caches() {
+            return;
+        }
+        let dropped: HashSet<&SqlIdentifier> = tables.iter().map(|table| &table.name).collect();
+        let mut gone = 0;
+        self.inline_literal_caches.retain(|_, caches| {
+            caches.retain(|cache| {
+                // A statement whose tables cannot be read stays: it names none of them as far as
+                // this can tell, and giving it up would strand a cache still being served.
+                let Some(referenced) = extract_from_view_create_request(&cache.request) else {
+                    return true;
+                };
+                let reads_dropped = referenced.iter().any(|table| dropped.contains(&table.name));
+                gone += usize::from(reads_dropped);
+                !reads_dropped
+            });
+            !caches.is_empty()
+        });
+        if gone > 0 {
+            self.inline_literal_caches_live
+                .fetch_sub(gone, atomic::Ordering::Release);
+            self.inline_literal_caches_generation
+                .fetch_add(1, atomic::Ordering::Release);
+        }
+    }
+
+    /// Forget every one of them. Used by DROP ALL CACHES.
+    pub fn clear_inline_literal_caches(&self) {
+        self.inline_literal_caches.clear();
+        self.inline_literal_caches_live
+            .store(0, atomic::Ordering::Release);
+        self.inline_literal_caches_generation
+            .fetch_add(1, atomic::Ordering::Release);
     }
 
     /// Record that the in-request-path filter has rejected this query, and
@@ -1051,6 +1264,7 @@ impl QueryStatusCache {
 impl SchemaChangeHandler for QueryStatusCache {
     fn invalidate_for_tables(&self, tables: &[Relation]) {
         self.invalidate_queries_referencing_tables(tables);
+        self.remove_inline_literal_caches_referencing_tables(tables);
     }
 
     fn invalidate_all(&self) {
@@ -1075,6 +1289,11 @@ impl SchemaChangeHandler for QueryStatusCache {
             statuses.pop(&id);
         }
         self.persistent_handle.pending_inlined_migrations.clear();
+        drop(statuses);
+
+        // Every entry here belongs to a deep cache, and every deep status was just dropped, so
+        // none of these shapes can route a read any more.
+        self.clear_inline_literal_caches();
     }
 }
 
@@ -2041,5 +2260,230 @@ mod tests {
             0,
             "skip map should be bulk-cleared after crossing the soft cap"
         );
+    }
+
+    /// Rewrite `query`, either parameterizing every literal it can or keeping them inline.
+    fn rewrite(query: &str, autoparameterize: bool) -> (SelectStatement, DfQueryParameters) {
+        let mut catalog = schema_catalog::SchemaCatalog::default();
+        catalog.view_schemas.insert(
+            Relation {
+                schema: None,
+                name: "t".into(),
+            },
+            vec!["a".into(), "b".into(), "v".into()],
+        );
+        let context = schema_catalog::RewriteContext::new(
+            readyset_data::Dialect::DEFAULT_MYSQL,
+            std::sync::Arc::new(catalog),
+            vec![],
+        );
+        let params = readyset_sql_passes::adapter_rewrites::AdapterRewriteParams {
+            dialect: readyset_sql::Dialect::MySQL,
+            server_supports_topk: false,
+            server_supports_pagination: false,
+            server_supports_mixed_comparisons: false,
+            autoparameterize,
+        };
+        let mut stmt = select_statement(query).unwrap();
+        let out = readyset_sql_passes::adapter_rewrites::rewrite_query(&mut stmt, params, &context)
+            .unwrap();
+        (stmt, out)
+    }
+
+    /// The slots a read carries, which is what it is matched by.
+    fn read_slots(query: &str) -> LiteralSlots {
+        rewrite(query, true).1.slots().clone()
+    }
+
+    /// File `query` as a cache keeping its literals inline, the way `CREATE CACHE` does: the shape
+    /// and the slots come from the form that parameterizes everything, the served form from the
+    /// one that keeps them.
+    fn register(cache: &QueryStatusCache, name: &str, query: &str) -> QueryId {
+        let (shape_stmt, canonical) = rewrite(query, true);
+        let shape = QueryId::from_select(&shape_stmt, &[]);
+        assert!(
+            canonical.slots().inline_positions() > 0,
+            "{query} keeps no literal inline, so it would need no entry"
+        );
+        let (form, params) = rewrite(query, false);
+        cache.register_inline_literal_cache(
+            shape,
+            Relation::from(name),
+            canonical.slots().clone(),
+            ViewCreateRequest::new(form, vec![]),
+            params,
+        );
+        shape
+    }
+
+    #[test]
+    fn the_guard_answers_false_until_a_cache_is_registered() {
+        let cache = QueryStatusCache::new();
+        assert!(!cache.may_have_inline_literal_caches());
+        register(&cache, "kept", "SELECT v FROM t WHERE a = 1");
+        assert!(cache.may_have_inline_literal_caches());
+    }
+
+    #[test]
+    fn a_read_reaches_the_cache_holding_more_of_its_literals() {
+        let cache = QueryStatusCache::new();
+        // Registered least-specific first, so order of arrival cannot be what decides.
+        register(&cache, "one", "SELECT v FROM t WHERE a = 1 AND b = ?");
+        let shape = register(&cache, "both", "SELECT v FROM t WHERE a = 1 AND b = 2");
+
+        let (_, _, lookup) = cache
+            .match_inline_literal_cache(
+                &shape,
+                &read_slots("SELECT v FROM t WHERE a = 1 AND b = 2"),
+            )
+            .expect("a read spelling both out belongs to a cache");
+        // The cache holding both literals leaves nothing to look up, where the one holding only
+        // `a` would leave `b`. An empty key is what says which of the two won.
+        assert!(
+            lookup.is_empty(),
+            "expected the cache holding both literals, got a lookup of {lookup:?}"
+        );
+    }
+
+    #[test]
+    fn the_winner_does_not_depend_on_registration_order() {
+        let forwards = QueryStatusCache::new();
+        register(&forwards, "one", "SELECT v FROM t WHERE a = 1 AND b = ?");
+        let shape = register(&forwards, "both", "SELECT v FROM t WHERE a = 1 AND b = 2");
+
+        let backwards = QueryStatusCache::new();
+        register(&backwards, "both", "SELECT v FROM t WHERE a = 1 AND b = 2");
+        register(&backwards, "one", "SELECT v FROM t WHERE a = 1 AND b = ?");
+
+        let read = read_slots("SELECT v FROM t WHERE a = 1 AND b = 2");
+        let won = |c: &QueryStatusCache| {
+            format!(
+                "{:?}",
+                c.match_inline_literal_cache(&shape, &read)
+                    .expect("a read belongs to a cache")
+                    .0
+                    .statement
+            )
+        };
+        assert_eq!(
+            won(&forwards),
+            won(&backwards),
+            "recovery order must not change the winner"
+        );
+    }
+
+    #[test]
+    fn two_names_for_the_same_literals_share_one_entry() {
+        let cache = QueryStatusCache::new();
+        let shape = register(&cache, "first", "SELECT v FROM t WHERE a = 1");
+        register(&cache, "second", "SELECT v FROM t WHERE a = 1");
+        assert_eq!(
+            cache.inline_literal_caches.get(&shape).unwrap().len(),
+            1,
+            "agreeing on every position joins the entry rather than adding one"
+        );
+
+        let read = read_slots("SELECT v FROM t WHERE a = 1");
+        cache.remove_inline_literal_cache_by_name(&Relation::from("first"));
+        assert!(
+            cache.match_inline_literal_cache(&shape, &read).is_some(),
+            "a name still claims it"
+        );
+        cache.remove_inline_literal_cache_by_name(&Relation::from("second"));
+        assert!(
+            cache.match_inline_literal_cache(&shape, &read).is_none(),
+            "no name claims it any more"
+        );
+    }
+
+    #[test]
+    fn a_schema_change_gives_up_the_entries_over_the_tables_it_names() {
+        use schema_catalog::SchemaChangeHandler;
+
+        let cache = QueryStatusCache::new();
+        let kept = register(&cache, "on_t", "SELECT v FROM t WHERE a = 1");
+        register(&cache, "on_t2", "SELECT z FROM t2 WHERE x = 1");
+        assert!(cache.may_have_inline_literal_caches());
+
+        // A change to another table leaves both alone.
+        cache.invalidate_for_tables(&[Relation::from("unrelated")]);
+        assert_eq!(cache.inline_literal_caches.len(), 2);
+
+        // One naming `t` takes only the entry reading from it.
+        cache.invalidate_for_tables(&[Relation::from("t")]);
+        assert!(
+            cache.inline_literal_caches.get(&kept).is_none(),
+            "the entry over `t` should be gone"
+        );
+        assert!(
+            cache.may_have_inline_literal_caches(),
+            "the entry over `t2` still holds literals inline"
+        );
+
+        // And one naming every table leaves nothing behind.
+        cache.invalidate_for_tables(&[Relation::from("t2")]);
+        assert!(!cache.may_have_inline_literal_caches());
+    }
+
+    #[test]
+    fn invalidating_every_query_gives_up_every_entry() {
+        use schema_catalog::SchemaChangeHandler;
+
+        let cache = QueryStatusCache::new();
+        register(&cache, "one", "SELECT v FROM t WHERE a = 1");
+        register(&cache, "two", "SELECT z FROM t2 WHERE x = 1");
+        assert!(cache.may_have_inline_literal_caches());
+
+        cache.invalidate_all();
+        assert!(
+            !cache.may_have_inline_literal_caches(),
+            "every entry belongs to a deep cache whose status was just dropped"
+        );
+    }
+
+    #[test]
+    fn the_guard_falls_back_once_the_last_cache_is_dropped() {
+        let cache = QueryStatusCache::new();
+        register(&cache, "one", "SELECT v FROM t WHERE a = 1");
+        register(&cache, "two", "SELECT v FROM t WHERE a = 1 AND b = 2");
+        assert!(cache.may_have_inline_literal_caches());
+
+        cache.remove_inline_literal_cache_by_name(&Relation::from("one"));
+        assert!(
+            cache.may_have_inline_literal_caches(),
+            "one cache still holds literals inline"
+        );
+        cache.remove_inline_literal_cache_by_name(&Relation::from("two"));
+        assert!(
+            !cache.may_have_inline_literal_caches(),
+            "a read should stop working its shape out once none is left"
+        );
+    }
+
+    #[test]
+    fn two_names_on_one_entry_keep_the_guard_up_until_both_go() {
+        let cache = QueryStatusCache::new();
+        register(&cache, "first", "SELECT v FROM t WHERE a = 1");
+        register(&cache, "second", "SELECT v FROM t WHERE a = 1");
+        cache.remove_inline_literal_cache_by_name(&Relation::from("first"));
+        assert!(
+            cache.may_have_inline_literal_caches(),
+            "the entry is still claimed by a name"
+        );
+        cache.remove_inline_literal_cache_by_name(&Relation::from("second"));
+        assert!(!cache.may_have_inline_literal_caches());
+    }
+
+    #[test]
+    fn dropping_every_cache_forgets_them_all() {
+        let cache = QueryStatusCache::new();
+        let shape = register(&cache, "kept", "SELECT v FROM t WHERE a = 1");
+        cache.clear_inline_literal_caches();
+        assert!(
+            cache
+                .match_inline_literal_cache(&shape, &read_slots("SELECT v FROM t WHERE a = 1"))
+                .is_none()
+        );
+        assert!(!cache.may_have_inline_literal_caches());
     }
 }

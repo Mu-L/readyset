@@ -148,6 +148,8 @@ where
         }
 
         event.destination = Some(QueryDestination::Readyset(None));
+        // A cache created from a read names no AUTOPARAM option of its own, so it parameterizes
+        // every literal it can, whatever option the caches around it were given.
         let create_if_missing = settings.migration_mode == MigrationMode::InRequestPath;
 
         let ctx = ExecuteSelectContext::AdHoc {

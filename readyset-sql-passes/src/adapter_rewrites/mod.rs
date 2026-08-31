@@ -838,7 +838,7 @@ impl DfQueryParameters {
     ///
     /// A read served this way carries no parameters of its own, so no placeholder order remains
     /// to restore.
-    pub fn for_read(mut self, read: &Self, lookup: Vec<(usize, Literal)>) -> Self {
+    pub fn for_read(mut self, read: &Self, lookup: CacheLookupKey) -> Self {
         self.auto_parameters = lookup;
         self.pagination_parameters = read.pagination_parameters.clone();
         self.reordered_placeholders = None;

@@ -1,0 +1,19 @@
+# A cache built `WITH (AUTOPARAM OFF)` keeps its author's literals inline, so it is reached by a
+# read carrying those same literals rather than by the parameterized form autoparameterization
+# would otherwise produce. Out of band, nothing migrates on demand, so answering the read at all
+# is what proves it reached the cache.
+
+statement ok
+CREATE TABLE t (id int PRIMARY KEY, a text, b int)
+
+statement ok
+INSERT INTO t VALUES (1,'x',1),(2,'x',2),(5,'x',1)
+
+statement ok
+CREATE CACHE row_eq_literal WITH (AUTOPARAM OFF) FROM SELECT id FROM t WHERE (a, b) = ('x', 1)
+
+query I rowsort
+SELECT id FROM t WHERE (a, b) = ('x', 1)
+----
+1
+5

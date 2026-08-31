@@ -1,0 +1,901 @@
+use mysql_async::Conn;
+use mysql_async::prelude::Queryable;
+use readyset_adapter::query_status_cache::MigrationStyle;
+use readyset_adapter::backend::{MigrationMode, QueryInfo};
+use readyset_client_metrics::QueryDestination;
+use readyset_client_test_helpers::mysql_helpers::{self, MySQLAdapter};
+use readyset_client_test_helpers::{TestBuilder, sleep};
+use readyset_server::Handle;
+use readyset_sql_parsing::ParsingPreset;
+use readyset_util::shutdown::ShutdownSender;
+use test_utils::{tags, upstream};
+
+/// Fire an `EXPLAIN LAST STATEMENT` and assert where the previous query went.
+async fn assert_last_target_was(rs_conn: &mut Conn, expected: QueryDestination) {
+    let destination: QueryInfo = rs_conn
+        .query_first("EXPLAIN LAST STATEMENT")
+        .await
+        .unwrap()
+        .unwrap();
+    let msg = destination.reason;
+    assert_eq!(destination.destination, expected, "{msg}");
+}
+
+/// Bring up an adapter over a fresh database, with `autoparameterize` deciding whether caches
+/// keep the literals their author wrote inline. Out-of-band migration keeps a plain SELECT from
+/// creating a cache of its own, so what routes a read is only ever an explicit CREATE CACHE.
+async fn adapter(db_name: &str, schema: &str) -> (Conn, Conn, Handle, ShutdownSender) {
+    adapter_with_preset(db_name, schema, ParsingPreset::for_tests()).await
+}
+
+/// As `adapter`, with the parser named. `AUTOPARAM ON` reaches only the sqlparser parser, so a
+/// statement writing it parses with that parser alone.
+async fn adapter_with_preset(
+    db_name: &str,
+    schema: &str,
+    preset: ParsingPreset,
+) -> (Conn, Conn, Handle, ShutdownSender) {
+    readyset_tracing::init_test_logging();
+    mysql_helpers::recreate_database(db_name).await;
+
+    let (rs_opts, handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .parsing_preset(preset)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+
+    upstream_conn.query_drop(schema).await.unwrap();
+    sleep().await;
+
+    (rs_conn, upstream_conn, handle, shutdown_tx)
+}
+
+const T: &str = "CREATE TABLE t (id int, status varchar(16), v int); \
+                 INSERT INTO t (id, status, v) VALUES \
+                 (1, 'active', 10), (1, 'archived', 20), (2, 'active', 30), (1, 'pending', 40);";
+
+/// The behaviour the mode exists for. A cache written with one position left to a placeholder
+/// and another spelled out is reached by an ad-hoc read that spells the same literal out: both
+/// autoparameterize to one shape, and the slots filed under that shape put the literal back.
+///
+/// A read spelling out a different value there is a different query, and goes upstream.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_literal_read_reaches_a_cache_that_kept_its_literal() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_literal_read", T).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Ad-hoc, spelling out the literal the cache kept: served by that cache.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    // The parameterized position still serves every value of itself.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    // A different value where the cache kept a literal is a different query: upstream, correct.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A cache keeping its literals inline is registered wherever a deep cache is built, not only
+/// where the mode is exactly `deep`. Under `deep-then-shallow` a plain `CREATE CACHE` still
+/// resolves deep, so the read has to reach it without waiting for a restart to re-register it.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_kept_literal_cache_is_reachable_under_deep_then_shallow() {
+    readyset_tracing::init_test_logging();
+    let db_name = "autoparam_mode_deep_then_shallow";
+    mysql_helpers::recreate_database(db_name).await;
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .cache_mode(readyset_client::CacheMode::DeepThenShallow)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+    upstream_conn.query_drop(T).await.unwrap();
+    sleep().await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    // The literal the cache kept is part of its shape, so another value is another query.
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A literal `IN` is the shape the mode exists for: parameterizing it would explode into one
+/// lookup key per element, so the cache keeps it inline and the server has to lower it as an
+/// ordinary filter.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_kept_in_list_is_lowered_as_a_filter() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_kept_in", T).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept_in WITH (AUTOPARAM OFF) FROM \
+             SELECT v FROM t WHERE id = ? AND status IN ('active', 'archived')",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let mut result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status IN ('active', 'archived')")
+        .await
+        .unwrap();
+    result.sort();
+    // `pending` shares this `id`, so the kept list is what excludes it: a dropped predicate
+    // would return it too.
+    assert_eq!(result, vec![10, 20]);
+    assert_last_target_was(
+        &mut rs_conn,
+        QueryDestination::Readyset(Some("kept_in".into())),
+    )
+    .await;
+
+    // A different list is a different query, whatever its length.
+    for other in [
+        "SELECT v FROM t WHERE id = 1 AND status IN ('active')",
+        "SELECT v FROM t WHERE id = 1 AND status IN ('active', 'archived', 'pending')",
+    ] {
+        let _: Vec<i32> = rs_conn.query(other).await.unwrap();
+        assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Auto-creation never mints a cache that keeps a literal inline. Three reads differing only in
+/// that literal share one parameterized cache, where one per literal would multiply caches by the
+/// column's cardinality.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn auto_creation_mints_one_cache_for_every_literal() {
+    readyset_tracing::init_test_logging();
+    let db_name = "autoparam_mode_no_mint";
+    mysql_helpers::recreate_database(db_name).await;
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::InRequestPath)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+    upstream_conn.query_drop(T).await.unwrap();
+    sleep().await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let before: Vec<mysql_async::Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+
+    for status in ["archived", "pending", "deleted"] {
+        let _: Vec<i32> = rs_conn
+            .query(format!("SELECT v FROM t WHERE id = 1 AND status = '{status}'"))
+            .await
+            .unwrap();
+    }
+    sleep().await;
+
+    let after: Vec<mysql_async::Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "three literals should share one parameterized cache: {} -> {}",
+        before.len(),
+        after.len()
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// One shape holds every cache over it, since two caches differing only in a literal share it.
+/// A read reaches whichever of them holds the literals it carries.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn one_shape_holds_several_caches() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_one_shape", T).await;
+
+    rs_conn
+        .query_drop("CREATE CACHE active WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = ? AND status = 'active'")
+        .await
+        .unwrap();
+    rs_conn
+        .query_drop("CREATE CACHE archived WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = ? AND status = 'archived'")
+        .await
+        .unwrap();
+    // A cache keeping the other position stands alongside them, which is what a read carrying
+    // its literals is matched against.
+    rs_conn
+        .query_drop("CREATE CACHE by_id WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE id = 1 AND status = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Each read reaches the one cache holding the literals it carries.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("active".into()))).await;
+
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![20]);
+    assert_last_target_was(
+        &mut rs_conn,
+        QueryDestination::Readyset(Some("archived".into())),
+    )
+    .await;
+
+    // Dropping one gives up only its own claim: the others still serve.
+    rs_conn.query_drop("DROP CACHE archived").await.unwrap();
+    sleep().await;
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("active".into()))).await;
+
+    // And the read whose literals only the dropped cache held goes upstream.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 2 AND status = 'archived'")
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A cache naming no option parameterizes every literal in a position that supports it, so one
+/// cache serves every value of each.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_cache_naming_no_option_parameterizes_every_literal() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) = adapter("autoparam_mode_default", T).await;
+
+    rs_conn
+        .query_drop("CREATE CACHE every FROM SELECT v FROM t WHERE id = ? AND status = 'active'")
+        .await
+        .unwrap();
+    sleep().await;
+
+    // The literal the author spelled out became a parameter, so the cache serves other values
+    // of it too.
+    for (status, expected) in [("active", vec![10]), ("archived", vec![20])] {
+        let result: Vec<i32> = rs_conn
+            .query(format!("SELECT v FROM t WHERE id = 1 AND status = '{status}'"))
+            .await
+            .unwrap();
+        assert_eq!(result, expected, "status = {status}");
+        assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("every".into()))).await;
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A cache whose limit clause the adapter applies has it stripped before the shape is taken, so
+/// the cache's view holds unbounded rows and a read of that shape has to be bounded by its own
+/// limit rather than the one its cache was created with.
+///
+/// This holds where the server builds no TopK node, which is this harness's configuration. With
+/// TopK on, a literal limit stays in the shape instead; the tests over [`topk_adapter`] cover
+/// that side.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_read_keeps_its_own_limit() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_pagination", T).await;
+
+    rs_conn
+        .query_drop("CREATE CACHE paged WITH (AUTOPARAM OFF) FROM SELECT v FROM t WHERE status = 'active' LIMIT 1")
+        .await
+        .unwrap();
+    sleep().await;
+
+    let one: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'active' LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 1);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("paged".into()))).await;
+
+    // Two rows carry 'active'. The read asking for both has to get both.
+    let mut both: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'active' LIMIT 10")
+        .await
+        .unwrap();
+    both.sort();
+    assert_eq!(both, vec![10, 30], "the read's own LIMIT has to bound it");
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("paged".into()))).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+
+/// `AUTOPARAM ON` is accepted and parameterizes, which is what an absent clause does too. It is
+/// kept so a statement naming it round-trips through the DDL the authority persists.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_cache_naming_autoparam_on_parameterizes() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter_with_preset("autoparam_percache_on", T, ParsingPreset::OnlySqlparser).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE opened WITH (AUTOPARAM ON) \
+             FROM SELECT v FROM t WHERE id = 1 AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Both literals became parameters, so a read naming other values reaches the same cache.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 2 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("opened".into()))).await;
+
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("opened".into()))).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A cache keeping its literals inline and one parameterizing the same shape serve alongside each
+/// other: neither hides the other.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_kept_literal_does_not_hide_a_parameterized_cache() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_percache_mixed", T).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    rs_conn
+        .query_drop("CREATE CACHE both FROM SELECT v FROM t WHERE id = ? AND status = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    // The literal this read spells out is the one `kept` holds inline.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    // No cache kept this one, so the parameterized cache serves it.
+    let result: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'archived'")
+        .await
+        .unwrap();
+    assert_eq!(result, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("both".into()))).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A scoped exclusion cannot be routed to, since a read has no way to name the scope its own
+/// literals came from, so the statement is refused rather than built as something else.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn an_exclusion_scope_is_refused() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_percache_exclude", T).await;
+
+    let err = rs_conn
+        .query_drop(
+            "CREATE CACHE scoped WITH (AUTOPARAM (EXCLUDE_JOINS)) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .expect_err("an exclusion scope is not supported");
+    assert!(
+        err.to_string().to_lowercase().contains("exclusion"),
+        "unexpected error: {err}"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// `SHOW CACHES` names the option every deep cache was created with, so which caches keep their
+/// author's literals inline is visible without reading each query text for an inline literal.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn show_caches_names_a_cache_that_keeps_its_literals() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_show_caches", T).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    rs_conn
+        .query_drop("CREATE CACHE plain FROM SELECT v FROM t WHERE id = ? AND status = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    let rows: Vec<(String, String, String, String, String)> =
+        rs_conn.query("SHOW CACHES").await.unwrap();
+    let properties = |name: &str| {
+        rows.iter()
+            .find(|(_, n, ..)| n == name)
+            .map(|(_, _, _, p, _)| p.clone())
+            .unwrap_or_else(|| panic!("{name} is not listed"))
+    };
+    assert!(
+        properties("kept").contains("autoparam off"),
+        "expected the option to be listed, got {:?}",
+        properties("kept")
+    );
+    assert!(
+        properties("plain").contains("autoparam on"),
+        "a cache that parameterizes says so too, got {:?}",
+        properties("plain")
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A query reaches the status cache already rewritten, so naming one by id leaves no literals for
+/// `AUTOPARAM OFF` to keep. The statement is refused rather than built as an ordinary cache.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn keeping_literals_from_a_query_id_is_refused() {
+    readyset_tracing::init_test_logging();
+    let db_name = "autoparam_from_id";
+    mysql_helpers::recreate_database(db_name).await;
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .migration_style(MigrationStyle::Explicit)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+    upstream_conn.query_drop(T).await.unwrap();
+    sleep().await;
+
+    // Proxy a query so it is recorded with an id of its own.
+    let _: Vec<i32> = rs_conn
+        .query("SELECT id FROM t WHERE v = 999")
+        .await
+        .unwrap_or_default();
+    sleep().await;
+    let proxied: Vec<(String, String, String, String)> =
+        rs_conn.query("SHOW PROXIED QUERIES").await.unwrap();
+    let query_id = proxied
+        .first()
+        .map(|(id, ..)| id.clone())
+        .expect("the proxied query is recorded with an id");
+
+    let err = rs_conn
+        .query_drop(format!(
+            "CREATE CACHE from_id WITH (AUTOPARAM OFF) FROM {query_id}"
+        ))
+        .await
+        .expect_err("a query id keeps no literals to act on");
+    assert!(
+        err.to_string().to_lowercase().contains("autoparam"),
+        "unexpected error: {err}"
+    );
+
+    // The same id without the option still caches, so only what cannot be honoured is refused.
+    rs_conn
+        .query_drop(format!("CREATE CACHE plain_id FROM {query_id}"))
+        .await
+        .expect("a query id caches as usual");
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A statement keeping its literals inline is refused where a read could not reach the cache it
+/// would build.
+///
+/// The shape a read hashes to comes out of the rewrite's structural passes, and those run only
+/// for a statement holding no placeholder. A statement holding one alongside a join or a subquery
+/// takes a shape no read arrives at, so the cache would serve nothing and the statement is
+/// refused instead. A single-table statement is unaffected: there the passes reshape nothing, so
+/// the two shapes coincide and a read reaches the cache.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_placeholder_in_a_nested_statement_is_refused() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_nested", T).await;
+
+    let refused = rs_conn
+        .query_drop(
+            "CREATE CACHE gated WITH (AUTOPARAM OFF) \
+             FROM SELECT d.v FROM (SELECT id, status, v FROM t) AS d \
+             WHERE d.id = ? AND d.status = 'active'",
+        )
+        .await;
+    let err = refused.expect_err("a nested statement with a placeholder has to be refused");
+    assert!(
+        err.to_string().contains("AUTOPARAM with a placeholder"),
+        "unexpected error: {err}"
+    );
+
+    // The same option over a single-table statement still builds a cache a read reaches.
+    rs_conn
+        .query_drop(
+            "CREATE CACHE flat WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let got: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(got, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("flat".into()))).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+
+/// A cache that keeps its literals inline is reached by an ad-hoc read, which carries its
+/// literals as text.
+///
+/// Disabled, and known to fail. A prepared statement's values arrive at execute, after the form
+/// it was planned against is fixed, so the literals that pick the cache are not in hand when the
+/// plan is made. Closing this means matching at execute, where the statement id is known and can
+/// name the form to use. The test is kept as the specification.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+#[ignore = "a prepared statement is planned before its values arrive, so it cannot pick a cache \
+            by them yet"]
+async fn a_prepared_read_reaches_a_per_cache_off_cache() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_prepared_pc", T).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    // The ad-hoc form carries its literals as text and reaches the cache directly.
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE id = 1 AND status = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    let rows: Vec<i32> = rs_conn
+        .exec("SELECT v FROM t WHERE id = ? AND status = 'active'", (1,))
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Rows enough that every limit in the TopK tests is a real bound: three per status, ordered by
+/// `v`, and a `pending` row so a read that matches no cache still proves the upstream answered.
+const TK: &str = "CREATE TABLE t (id int, status varchar(16), v int); \
+                  INSERT INTO t (id, status, v) VALUES \
+                  (1, 'active', 10), (2, 'active', 30), (3, 'active', 50), \
+                  (4, 'archived', 20), (5, 'archived', 40), (6, 'archived', 60), \
+                  (7, 'pending', 70);";
+
+/// Like [`adapter`], but with the server building TopK nodes, the production default. A literal
+/// `LIMIT` under an `ORDER BY` then stays in the shape a read hashes to, while a placeholder
+/// `LIMIT` is stripped from it, so the two spellings of one query take different shapes.
+async fn topk_adapter(db_name: &str, schema: &str) -> (Conn, Conn, Handle, ShutdownSender) {
+    readyset_tracing::init_test_logging();
+    mysql_helpers::recreate_database(db_name).await;
+
+    let (rs_opts, handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .parsing_preset(ParsingPreset::OnlySqlparser)
+        .set_topk(true)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+
+    upstream_conn.query_drop(schema).await.unwrap();
+    sleep().await;
+
+    (rs_conn, upstream_conn, handle, shutdown_tx)
+}
+
+/// A cache that kept a literal `LIMIT` under an `ORDER BY` is a TopK cache: the limit is part of
+/// the shape it is filed under, so only a read spelling out that limit reaches it. A read with
+/// another limit tries the stripped shape too, and no cache is filed there.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_topk_read_reaches_the_cache_that_kept_its_limit() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_kept_limit", TK).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE lit WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10, 30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lit".into()))).await;
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A cache created with a placeholder `LIMIT` is filed under the shape that strips the limit,
+/// while a read spelling one out under an `ORDER BY` first takes the shape that keeps it. The
+/// read reaches the cache on a second attempt without the limit -- the same second attempt the
+/// router makes for an ordinary cache -- and its own limit bounds the rows.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_literal_limit_read_reaches_a_cache_with_a_placeholder_limit() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_placeholder_limit", TK).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE par WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let served = QueryDestination::Readyset(Some("par".into()));
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, served.clone()).await;
+
+    // Another limit is the same query to this cache: the read's own limit bounds it.
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20, 40]);
+    assert_last_target_was(&mut rs_conn, served).await;
+
+    // The second attempt lands on the shape the cache is filed under, but the literal it kept
+    // still decides: a different value there is a different query.
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'pending' ORDER BY v LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![70]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    // Dropping the cache takes the second attempt's target with it.
+    rs_conn.query_drop("DROP CACHE par").await.unwrap();
+    sleep().await;
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// One query text can stand behind two caches at once: one that kept its literal limit and one
+/// created with a placeholder. The read whose limit the kept cache holds reaches it on the first
+/// attempt, so the server does the bounding; every other limit falls through to the placeholder
+/// cache on the second. Dropping the kept cache leaves its read the second attempt.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_read_prefers_the_cache_that_kept_its_exact_limit() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_two_caches", TK).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE lit2 WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2",
+        )
+        .await
+        .unwrap();
+    rs_conn
+        .query_drop(
+            "CREATE CACHE par WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20, 40]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lit2".into()))).await;
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("par".into()))).await;
+
+    rs_conn.query_drop("DROP CACHE lit2").await.unwrap();
+    sleep().await;
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20, 40]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("par".into()))).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// The second attempt runs exactly where the router retries an ordinary cache: behind an
+/// `ORDER BY`. An order-less literal limit keeps its one shape, so a cache filed under the
+/// stripped form is not reached by it.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn an_orderless_limit_read_takes_one_shape() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_orderless", TK).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE par_nord WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'archived' LIMIT ?",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let rows: Vec<i32> = rs_conn
+        .query("SELECT v FROM t WHERE status = 'archived' LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!([20, 40, 60].contains(&rows[0]), "an archived row, from upstream: {rows:?}");
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}

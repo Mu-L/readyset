@@ -52,6 +52,8 @@ SELECT id FROM t WHERE (a, b) != ('x', 1, 'z')
 # A partly parameterizable row comparison is not allowed.
 statement error
 CREATE CACHE row_mixed FROM SELECT id FROM t WHERE (a, b) = ('x', d)
+
+# A prepared row comparison binds one parameter per position.
 query I rowsort
 SELECT id FROM t WHERE (b, d) = (?, ?)
 ? = 1
