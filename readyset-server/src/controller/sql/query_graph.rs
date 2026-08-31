@@ -507,6 +507,21 @@ fn contains_placeholder(lhs: &Expr, rhs: &Expr) -> bool {
     is_placeholder(lhs) || is_placeholder(rhs)
 }
 
+/// Whether a row comparison can become lookup parameters: an equality pairing a column with a
+/// placeholder in every position. Any other row comparison has to be handled as a predicate.
+///
+/// The operator is part of the test because a parameter is emitted per position, which conjoins the
+/// positions. That is what `=` means, but `(a, b) < ($1, $2)` compares lexicographically and is not
+/// `a < $1 AND b < $2`.
+fn row_becomes_parameters(op: BinaryOperator, lhs: &[Expr], rhs: &[Expr]) -> bool {
+    op == BinaryOperator::Equal
+        && lhs.len() == rhs.len()
+        && lhs.iter().all(|e| matches!(e, Expr::Column(_)))
+        && rhs
+            .iter()
+            .all(|e| matches!(e, Expr::Literal(Literal::Placeholder(_))))
+}
+
 /// Whether an operand is a NULL literal, which is what separates `IS [NOT] NULL` from a null-safe
 /// comparison written with the same operators.
 fn is_null_literal(expr: &Expr) -> bool {
@@ -650,7 +665,9 @@ fn classify_conditionals(
                         });
                     }
 
-                    // Row equality: A Row of Columns compared to a Row of Placeholders
+                    // Row comparisons of unequal arity are malformed SQL that the upstream
+                    // rejects outright. Every arm below pairs the sides position by position,
+                    // so send the query to fallback rather than compare a truncation.
                     (
                         Expr::Row {
                             exprs: lhs_exprs, ..
@@ -658,7 +675,46 @@ fn classify_conditionals(
                         Expr::Row {
                             exprs: rhs_exprs, ..
                         },
-                    ) if lhs_exprs.len() == rhs_exprs.len() => {
+                    ) if lhs_exprs.len() != rhs_exprs.len() => {
+                        unsupported!("row comparison with unequal arity");
+                    }
+
+                    // A row comparison that is only partly parameterizable can be handled
+                    // neither way: taking the parameter path below would silently drop the
+                    // positions it cannot convert, and a placeholder cannot be lowered into a
+                    // filter expression. Send the query to fallback instead of answering it wrong.
+                    (
+                        Expr::Row {
+                            exprs: lhs_exprs, ..
+                        },
+                        Expr::Row {
+                            exprs: rhs_exprs, ..
+                        },
+                    ) if lhs_exprs.len() == rhs_exprs.len()
+                        && !row_becomes_parameters(*op, lhs_exprs, rhs_exprs)
+                        && lhs_exprs
+                            .iter()
+                            .chain(rhs_exprs.iter())
+                            .any(|e| matches!(e, Expr::Literal(Literal::Placeholder(_)))) =>
+                    {
+                        unsupported!("row comparison mixing placeholders with other expressions");
+                    }
+
+                    // Row equality: A Row of Columns compared to a Row of Placeholders.
+                    //
+                    // Only a tuple that pairs a column with a placeholder in every position
+                    // becomes lookup parameters. A row comparison with no placeholders at all
+                    // keeps the whole predicate instead, so it reaches the fallback arm below and
+                    // is evaluated as a filter: this arm extracts parameters and nothing else, so
+                    // claiming such a comparison would discard the constraint entirely.
+                    (
+                        Expr::Row {
+                            exprs: lhs_exprs, ..
+                        },
+                        Expr::Row {
+                            exprs: rhs_exprs, ..
+                        },
+                    ) if row_becomes_parameters(*op, lhs_exprs, rhs_exprs) => {
                         for (lf, expr) in lhs_exprs.iter().zip(rhs_exprs) {
                             if let Expr::Column(lf) = lf {
                                 if let Expr::Literal(Literal::Placeholder(placeholder)) = expr {
@@ -1878,6 +1934,56 @@ mod tests {
     use readyset_sql_parsing::{parse_query, parse_query_with_config, parse_select, ParsingPreset};
 
     use super::*;
+
+    /// A parameter is emitted per position, which conjoins them. That is what `=` means, so no
+    /// other operator may take the parameter path: `(a, b) < ($1, $2)` compares lexicographically,
+    /// which is not `a < $1 AND b < $2`.
+    #[test]
+    fn only_equality_row_comparisons_become_parameters() {
+        let cols = |names: [&str; 2]| {
+            names
+                .iter()
+                .map(|n| Expr::Column(Column::from(*n)))
+                .collect::<Vec<_>>()
+        };
+        let placeholders = (1..=2)
+            .map(|i| Expr::Literal(Literal::Placeholder(ItemPlaceholder::DollarNumber(i))))
+            .collect::<Vec<_>>();
+
+        assert!(row_becomes_parameters(
+            BinaryOperator::Equal,
+            &cols(["a", "b"]),
+            &placeholders
+        ));
+        for op in [
+            BinaryOperator::NotEqual,
+            BinaryOperator::Less,
+            BinaryOperator::GreaterOrEqual,
+        ] {
+            assert!(
+                !row_becomes_parameters(op, &cols(["a", "b"]), &placeholders),
+                "{op:?} conjoins its positions and must not take the parameter path"
+            );
+        }
+
+        // A literal in place of a placeholder cannot become a parameter.
+        let literal_rhs = vec![
+            Expr::Literal(Literal::Integer(1)),
+            Expr::Literal(Literal::Integer(2)),
+        ];
+        assert!(!row_becomes_parameters(
+            BinaryOperator::Equal,
+            &cols(["a", "b"]),
+            &literal_rhs
+        ));
+
+        // Mismatched arity never pairs up.
+        assert!(!row_becomes_parameters(
+            BinaryOperator::Equal,
+            &cols(["a", "b"]),
+            &placeholders[..1]
+        ));
+    }
 
     fn make_query_graph(sql: &str) -> QueryGraph {
         let query = match parse_query(Dialect::MySQL, sql).unwrap() {

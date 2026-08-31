@@ -1067,13 +1067,21 @@ fn mysql_type_conversion_body(left_ty: &DfType, right_ty: &DfType) -> DfType {
 /// not covered correctly or at all, so we will often see erroneous conversions to Double.
 ///
 /// [type conversion]: https://dev.mysql.com/doc/refman/8.4/en/type-conversion.html
-fn mysql_type_conversion(left_ty: &DfType, right_ty: &DfType) -> DfType {
+/// `None` is no conversion at all. A row and an array are compared element by element, so neither
+/// matches any of the rules, and the `Double` fallback would cast one to a number, which fails when
+/// the expression is evaluated.
+fn mysql_type_conversion(left_ty: &DfType, right_ty: &DfType) -> Option<DfType> {
+    let structural = |ty: &DfType| ty.is_array() || matches!(ty, DfType::Row(_));
+    if structural(left_ty) || structural(right_ty) {
+        return None;
+    }
+
     let ty = mysql_type_conversion_body(left_ty, right_ty);
-    if let DfType::Unknown = ty {
+    Some(if let DfType::Unknown = ty {
         DfType::Double
     } else {
         ty
-    }
+    })
 }
 
 impl BinaryOperator {
@@ -1229,18 +1237,14 @@ impl BinaryOperator {
         let (left_coerce, right_coerce) = match self {
             Add | Subtract | Multiply | Divide | Modulo | And | Or => match dialect.engine() {
                 SqlEngine::PostgreSQL => (None, None),
-                SqlEngine::MySQL => {
-                    let ty = mysql_type_conversion(left_type, right_type);
-                    (Some(ty.clone()), Some(ty))
-                }
+                SqlEngine::MySQL => mysql_type_conversion(left_type, right_type)
+                    .map_or((None, None), |ty| (Some(ty.clone()), Some(ty))),
             },
 
             Greater | GreaterOrEqual | Less | LessOrEqual => match dialect.engine() {
                 SqlEngine::PostgreSQL => pg_array_coercion(left_type, right_type),
-                SqlEngine::MySQL => {
-                    let ty = mysql_type_conversion(left_type, right_type);
-                    (Some(ty.clone()), Some(ty))
-                }
+                SqlEngine::MySQL => mysql_type_conversion(left_type, right_type)
+                    .map_or((None, None), |ty| (Some(ty.clone()), Some(ty))),
             },
 
             Like | ILike => (
@@ -1279,10 +1283,8 @@ impl BinaryOperator {
                         (None, Some(left_type.clone()))
                     }
                 }
-                SqlEngine::MySQL => {
-                    let ty = mysql_type_conversion(left_type, right_type);
-                    (Some(ty.clone()), Some(ty))
-                }
+                SqlEngine::MySQL => mysql_type_conversion(left_type, right_type)
+                    .map_or((None, None), |ty| (Some(ty.clone()), Some(ty))),
             },
 
             JsonExists => {

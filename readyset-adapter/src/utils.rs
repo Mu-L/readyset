@@ -209,6 +209,18 @@ impl<'ast> Visitor<'ast> for BinopsParameterColumnsVisitor<'ast> {
                         .push((c, binop.flip_ordering_comparison().unwrap_or(*binop)));
                     return Ok(());
                 }
+                // A row comparison takes one parameter per position pairing a column with a
+                // placeholder.
+                (Expr::Row { exprs: lhs, .. }, Expr::Row { exprs: rhs, .. }) => {
+                    for (lhs, rhs) in lhs.iter().zip(rhs) {
+                        if let (Expr::Column(c), Expr::Literal(Literal::Placeholder(_))) =
+                            (lhs, rhs)
+                        {
+                            self.parameter_cols.push((c, *binop));
+                        }
+                    }
+                    return Ok(());
+                }
                 _ => (),
             },
             Expr::In {

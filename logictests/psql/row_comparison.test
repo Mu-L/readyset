@@ -1,0 +1,62 @@
+# Row comparisons: `(a, b) = ($1, $2)` is a lookup, any other comparison of two rows is a
+# filter, and a row mixing a placeholder with other operands is unsupported.
+
+statement ok
+CREATE TABLE t (id int PRIMARY KEY, a text, b int, c text, d int)
+
+statement ok
+INSERT INTO t VALUES (1,'x',1,'x',1),(2,'x',2,'y',2),(3,'y',1,'y',1),(4,'z',3,'q',4),(5,'x',1,'x',2)
+
+# Columns on both sides are compared as a filter.
+query I rowsort
+SELECT id FROM t WHERE (a, b) = (c, d)
+----
+1
+3
+
+# Non-equality comparisons are filters.
+query I rowsort
+SELECT id FROM t WHERE (a, b) != ('x', 1)
+----
+2
+3
+4
+
+query I rowsort
+SELECT id FROM t WHERE (a, b) < ('y', 1)
+----
+1
+2
+5
+
+# An all-literal equality is a lookup.
+query I rowsort
+SELECT id FROM t WHERE (a, b) = ('x', 1)
+----
+1
+5
+
+# A row that stops satisfying the comparison leaves the result.
+statement ok
+UPDATE t SET d = 9 WHERE id = 3
+
+query I rowsort
+SELECT id FROM t WHERE (a, b) = (c, d)
+----
+1
+
+# Unequal arity is an error.
+statement error
+SELECT id FROM t WHERE (a, b) != ('x', 1, 'z')
+
+# A partly parameterizable row comparison is not allowed.
+statement error
+CREATE CACHE row_mixed FROM SELECT id FROM t WHERE (a, b) = ('x', d)
+
+# A prepared row comparison binds one parameter per position.
+query I rowsort
+SELECT id FROM t WHERE (b, d) = ($1, $2)
+$1 = 1
+$2 = 1
+----
+1
