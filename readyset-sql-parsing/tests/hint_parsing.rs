@@ -4,7 +4,10 @@ use readyset_sql::ast::{
     CacheInner, CacheType, EvictionPolicy, ReadysetHintDirective, SqlQuery, TrxCachePolicy,
 };
 use readyset_sql::Dialect;
-use readyset_sql_parsing::{parse_hint_directive, parse_query, parse_shallow_query};
+use readyset_sql_parsing::{
+    ParsingPreset, parse_hint_directive, parse_query, parse_query_with_config,
+    parse_shallow_query,
+};
 
 #[test]
 fn parse_hint_extracts_create_cache_directive() {
@@ -631,12 +634,19 @@ fn parse_create_cache_hint_topk_buffer_multiplier_duplicate_rejected() {
 
 // --- AUTOPARAM option tests (option is not part of the public SQL reference) ---
 
-fn parse_create_cache_statement(sql: &str) -> readyset_sql::ast::CreateCacheStatement {
-    let query = parse_query(Dialect::MySQL, sql).expect("should parse");
+fn parse_create_cache_with(
+    preset: ParsingPreset,
+    sql: &str,
+) -> readyset_sql::ast::CreateCacheStatement {
+    let query = parse_query_with_config(preset, Dialect::MySQL, sql).expect("should parse");
     let SqlQuery::CreateCache(stmt) = query else {
         panic!("expected CreateCache");
     };
     stmt
+}
+
+fn parse_create_cache_statement(sql: &str) -> readyset_sql::ast::CreateCacheStatement {
+    parse_create_cache_with(ParsingPreset::for_tests(), sql)
 }
 
 #[test]
@@ -652,11 +662,21 @@ fn parse_create_cache_autoparam_off() {
 
 #[test]
 fn parse_create_cache_autoparam_on() {
-    // `AUTOPARAM ON` is the explicit default: accepted, with no exclusions set.
-    let stmt = parse_create_cache_statement(
+    // `AUTOPARAM ON` parameterizes, as an absent clause does, and stays distinguishable from one
+    // so the clause the author wrote round-trips through the statement the authority persists.
+    // Only the sqlparser parser reads the clause that way, so this parses with that parser alone.
+    let stmt = parse_create_cache_with(
+        ParsingPreset::OnlySqlparser,
         "CREATE CACHE c WITH (AUTOPARAM ON) FROM SELECT id FROM t WHERE x = 1",
     );
-    assert!(stmt.autoparam.is_default());
+    assert!(stmt.autoparam.on);
+    assert!(!stmt.autoparam.off);
+    assert!(!stmt.autoparam.is_default());
+    assert!(stmt.autoparam.autoparameterize());
+
+    let unset = parse_create_cache_statement("CREATE CACHE c FROM SELECT id FROM t WHERE x = 1");
+    assert!(unset.autoparam.is_default());
+    assert!(unset.autoparam.autoparameterize());
 }
 
 #[test]

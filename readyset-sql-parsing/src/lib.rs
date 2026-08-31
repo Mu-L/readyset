@@ -725,8 +725,7 @@ fn parse_autoparam_option(
         return Ok(Some(ctrl));
     }
     if consume_bare_ident(parser, "on") {
-        // Explicit default (autoparameterize everything); lets generated DDL always emit an
-        // AUTOPARAM clause rather than conditionally omitting it.
+        ctrl.on = true;
         return Ok(Some(ctrl));
     }
     parser.expect_token(&Token::LParen)?;

@@ -580,7 +580,7 @@ impl Change {
                 // The statement's own option decides the recipe's form, so it matches the one
                 // the adapter built from the same statement.
                 let mut adapter_rewrite_params = adapter_rewrite_params;
-                adapter_rewrite_params.autoparameterize = !autoparam.off;
+                adapter_rewrite_params.autoparameterize = autoparam.autoparameterize();
                 adapter_rewrites::rewrite_query(
                     &mut statement,
                     adapter_rewrite_params,

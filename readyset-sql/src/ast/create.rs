@@ -1109,15 +1109,21 @@ impl TrxCachePolicy {
 /// of the public SQL reference; for internal and power-user use.
 ///
 /// Autoparameterization can make some queries uncacheable or produce pathological indices, so
-/// power users sometimes want to keep specific literals inline and parameterize by hand. Set via
-/// `WITH (AUTOPARAM OFF)` (skip entirely) or `WITH (AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS,
-/// EXCLUDE_SUBQUERIES))` (preserve literals originating in the named clause kinds). `AUTOPARAM ON`
-/// is the explicit default (every default field `false`), accepted so generated DDL can always
-/// emit an `AUTOPARAM` clause. Only affects the deep (`Auto`) parameterization path.
+/// power users sometimes want to keep specific literals inline and parameterize by hand.
+///
+/// Set via:
+/// - `WITH (AUTOPARAM OFF)` (skip entirely)
+/// - `WITH (AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS, EXCLUDE_SUBQUERIES))` (preserve literals
+///   originating in the named clause kinds)
+/// - `AUTOPARAM ON`, the explicit default, accepted so generated DDL can always emit a clause
+///
+/// Only affects the deep (`Auto`) parameterization path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
 pub struct AutoparamControl {
     /// `AUTOPARAM OFF`: skip autoparameterization entirely; preserve every literal.
     pub off: bool,
+    /// `AUTOPARAM ON`: parameterize every literal, whatever the deployment default is.
+    pub on: bool,
     /// `EXCLUDE_JOINS`: preserve literals in JOIN ON conditions.
     pub exclude_joins: bool,
     /// `EXCLUDE_EXISTS`: preserve literals originating in `EXISTS` / `NOT EXISTS` clauses.
@@ -1128,9 +1134,24 @@ pub struct AutoparamControl {
 }
 
 impl AutoparamControl {
-    /// True when no exclusions are requested (autoparameterize normally).
+    /// True when the statement carried no `AUTOPARAM` clause, and so defers to the deployment.
     pub fn is_default(&self) -> bool {
-        !self.off && !self.exclude_joins && !self.exclude_exists && !self.exclude_subqueries
+        !self.off
+            && !self.on
+            && !self.exclude_joins
+            && !self.exclude_exists
+            && !self.exclude_subqueries
+    }
+
+    /// Whether this statement's literals become parameters. Only `AUTOPARAM OFF` keeps them
+    /// inline; an absent clause and an explicit `AUTOPARAM ON` both parameterize.
+    pub fn autoparameterize(&self) -> bool {
+        !self.off
+    }
+
+    /// Whether a scoped exclusion was requested.
+    pub fn has_exclusions(&self) -> bool {
+        self.exclude_joins || self.exclude_exists || self.exclude_subqueries
     }
 }
 
@@ -1307,6 +1328,9 @@ impl DialectDisplay for CreateCacheOptions {
                 if self.autoparam.off {
                     sep(f)?;
                     write!(f, "AUTOPARAM OFF")?;
+                } else if self.autoparam.on {
+                    sep(f)?;
+                    write!(f, "AUTOPARAM ON")?;
                 } else if self.autoparam.exclude_joins
                     || self.autoparam.exclude_exists
                     || self.autoparam.exclude_subqueries

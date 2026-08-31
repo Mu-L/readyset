@@ -497,7 +497,7 @@ where
                     // The option decides the form the cache takes: `OFF` builds it with exactly
                     // the placeholders its author wrote.
                     let mut rewrite_params = connectors.noria.rewrite_params();
-                    rewrite_params.autoparameterize = !autoparam.off;
+                    rewrite_params.autoparameterize = autoparam.autoparameterize();
                     match deep {
                         Ok(mut deep) => match adapter_rewrites::rewrite_query(
                             &mut deep,
