@@ -45,6 +45,16 @@ SELECT id FROM t WHERE (a, b) = (c, d)
 ----
 1
 
+# An ordering comparison resolves each position against the column on its left, so a numeric
+# string compares as a number there just as it does in an equality.
+query I rowsort
+SELECT id FROM t WHERE (a, b) < ('y', '2')
+----
+1
+2
+3
+5
+
 # Unequal arity is an error.
 statement error
 SELECT id FROM t WHERE (a, b) != ('x', 1, 'z')

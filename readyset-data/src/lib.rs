@@ -596,7 +596,33 @@ impl DfValue {
         match self {
             DfValue::None => Ok(DfValue::None),
             DfValue::Array(arr) => match to_ty {
-                DfType::Row(_) => Ok(DfValue::Array(arr.clone())),
+                // Each field names the conversion for the element at its position, carrying the
+                // field the element came from as its source type.
+                DfType::Row(fields) => {
+                    let from_fields = match from_ty {
+                        DfType::Row(fields) => fields.as_ref(),
+                        _ => [].as_slice(),
+                    };
+                    let unchanged = arr.values().zip(fields).all(|(value, field)| match value {
+                        DfValue::Array(_) => false,
+                        DfValue::None => true,
+                        _ => {
+                            field.is_unknown()
+                                || value.infer_dataflow_type().try_into_known().as_ref()
+                                    == Some(field)
+                        }
+                    });
+                    if unchanged {
+                        return Ok(self.clone());
+                    }
+
+                    let mut row = (**arr).clone();
+                    for (i, (value, field)) in row.values_mut().zip(fields).enumerate() {
+                        *value = value
+                            .coerce_to(field, from_fields.get(i).unwrap_or(&DfType::Unknown))?;
+                    }
+                    Ok(DfValue::from(row))
+                }
                 DfType::Array(t) => Ok(DfValue::from(arr.coerce_to(t, from_ty)?)),
                 DfType::Text(collation) => Ok(DfValue::from_str_and_collation(
                     &arr.to_string(),

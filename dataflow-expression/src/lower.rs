@@ -1067,13 +1067,28 @@ fn mysql_type_conversion_body(left_ty: &DfType, right_ty: &DfType) -> DfType {
 /// not covered correctly or at all, so we will often see erroneous conversions to Double.
 ///
 /// [type conversion]: https://dev.mysql.com/doc/refman/8.4/en/type-conversion.html
-/// `None` is no conversion at all. A row and an array are compared element by element, so neither
-/// matches any of the rules, and the `Double` fallback would cast one to a number, which fails when
-/// the expression is evaluated.
+/// `None` is no conversion at all. An array is compared element by element, so it matches none of
+/// the rules, and the `Double` fallback would cast it to a number, which fails when the expression
+/// is evaluated.
+///
+/// A row is compared one position at a time, each position by the ordinary rules, so the conversion
+/// recurses into the fields rather than resolving one type for the whole row. A field left
+/// unconverted is typed [`DfType::Unknown`], naming no conversion for that position.
 fn mysql_type_conversion(left_ty: &DfType, right_ty: &DfType) -> Option<DfType> {
-    let structural = |ty: &DfType| ty.is_array() || matches!(ty, DfType::Row(_));
-    if structural(left_ty) || structural(right_ty) {
+    if left_ty.is_array() || right_ty.is_array() {
         return None;
+    }
+
+    if let (DfType::Row(left_fields), DfType::Row(right_fields)) = (left_ty, right_ty) {
+        return Some(DfType::Row(
+            left_fields
+                .iter()
+                .zip(right_fields)
+                .map(|(left_ty, right_ty)| {
+                    mysql_type_conversion(left_ty, right_ty).unwrap_or(DfType::Unknown)
+                })
+                .collect(),
+        ));
     }
 
     let ty = mysql_type_conversion_body(left_ty, right_ty);
@@ -1242,6 +1257,15 @@ impl BinaryOperator {
             },
 
             Greater | GreaterOrEqual | Less | LessOrEqual => match dialect.engine() {
+                // A row's positions resolve against the left side the way `Equal`'s do below:
+                // the field-wise cast is what turns an unknown-typed literal into the column's
+                // type, position by position.
+                SqlEngine::PostgreSQL
+                    if matches!(left_type, DfType::Row(_))
+                        && matches!(right_type, DfType::Row(_)) =>
+                {
+                    (None, Some(left_type.clone()))
+                }
                 SqlEngine::PostgreSQL => pg_array_coercion(left_type, right_type),
                 SqlEngine::MySQL => mysql_type_conversion(left_type, right_type)
                     .map_or((None, None), |ty| (Some(ty.clone()), Some(ty))),

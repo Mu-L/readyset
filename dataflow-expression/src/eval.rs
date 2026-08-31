@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::sync::Arc;
 
 use cached::cached;
-use readyset_data::{Array, ArrayD, Collation, DfValue, IxDyn, TimestampTz};
+use readyset_data::{Array, ArrayD, Collation, DfType, DfValue, IxDyn, TimestampTz};
 use readyset_errors::{
     internal_err, invalid_query_err, unsupported, ReadySetError, ReadySetResult,
 };
@@ -26,6 +26,59 @@ pub mod json;
 #[cached(max_size = 1000)]
 fn like_pattern(pattern: String, collation: Collation) -> Arc<LikePattern> {
     Arc::new(LikePattern::new(&pattern, collation))
+}
+
+/// Compare two rows one position at a time. The first position whose operands differ decides an
+/// ordering comparison, and a NULL reached before it leaves the comparison undecided; an equality
+/// is decided by any differing position, so a NULL leaves it undecided only once the rest match.
+///
+/// Other operators, `Is` above all, keep comparing the rows as whole values, the way an array
+/// does.
+fn eval_row_comparison(
+    op: BinaryOperator,
+    left: &DfValue,
+    right: &DfValue,
+) -> ReadySetResult<DfValue> {
+    use BinaryOperator::*;
+
+    if !matches!(op, Equal | Greater | GreaterOrEqual | Less | LessOrEqual) {
+        return eval_binary_op(op, left, right);
+    }
+
+    let left_row = non_null!(left).as_array()?;
+    let right_row = non_null!(right).as_array()?;
+    if left_row.values().count() != right_row.values().count() {
+        return Err(invalid_query_err!(
+            "row comparison operands hold different numbers of positions"
+        ));
+    }
+
+    let mut undecided = false;
+    let positions = left_row.values().zip(right_row.values());
+
+    for (left, right) in positions {
+        if left.is_none() || right.is_none() {
+            if op == Equal {
+                undecided = true;
+                continue;
+            }
+            return Ok(DfValue::None);
+        }
+
+        if left != right {
+            return Ok(match op {
+                Greater | GreaterOrEqual => left > right,
+                Less | LessOrEqual => left < right,
+                _ => false,
+            }
+            .into());
+        }
+    }
+
+    if undecided {
+        return Ok(DfValue::None);
+    }
+    Ok(matches!(op, Equal | GreaterOrEqual | LessOrEqual).into())
 }
 
 fn eval_binary_op(op: BinaryOperator, left: &DfValue, right: &DfValue) -> ReadySetResult<DfValue> {
@@ -310,7 +363,12 @@ impl Expr {
             } => {
                 let left_val = left.eval(record)?;
                 let right_val = right.eval(record)?;
-                eval_binary_op(*op, &left_val, &right_val)
+                match (left.ty(), right.ty()) {
+                    (DfType::Row(_), DfType::Row(_)) => {
+                        eval_row_comparison(*op, &left_val, &right_val)
+                    }
+                    _ => eval_binary_op(*op, &left_val, &right_val),
+                }
             }
             Expr::Not { expr, .. } => Ok((!non_null!(expr.eval(record)?).is_truthy()).into()),
             Expr::OpAny {
