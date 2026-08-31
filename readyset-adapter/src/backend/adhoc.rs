@@ -105,7 +105,7 @@ where
         view_request: ViewCreateRequest,
         mut status: QueryStatus,
         event: &mut QueryExecutionEvent,
-        mut params: DfQueryParameters,
+        params: DfQueryParameters,
         schema_generation: SchemaGeneration,
     ) -> Result<QueryResult<'a, DB>, DB::Error> {
         // Track the schema generation that was used to rewrite this query so that
@@ -123,35 +123,11 @@ where
             false
         };
 
-        // A manually parameterized cache (`AUTOPARAM`) claiming this query's standard shape
-        // serves the read regardless of the shape's own migration state.
-        let manual_cache = state
-            .query_status_cache
-            .manual_cache(&QueryId::from(&view_request));
-        let served_via_manual_cache = manual_cache.is_some();
-        if let Some(mc) = &manual_cache {
-            // The frozen literals travel with the params so the readsider can strip them from the
-            // lookup key; if they don't match these params the cache doesn't serve this query, so
-            // go straight upstream as a clean miss.
-            params.set_frozen(mc.frozen.clone());
-            if connectors.upstream.is_some() && !params.frozen_satisfied(&[])? {
-                return Self::query_fallback(
-                    connectors.upstream.as_mut(),
-                    original_query,
-                    event,
-                    None,
-                )
-                .await;
-            }
-        }
-
         // Test several conditions to see if we should proxy
         let upstream_exists = connectors.upstream.is_some();
         let proxy_out_of_band = settings.migration_mode != MigrationMode::InRequestPath
-            && !matches!(status.migration_state, MigrationState::Successful(_))
-            && manual_cache.is_none();
-        let unsupported = matches!(&status.migration_state, MigrationState::Unsupported(_))
-            && manual_cache.is_none();
+            && !matches!(status.migration_state, MigrationState::Successful(_));
+        let unsupported = matches!(&status.migration_state, MigrationState::Unsupported(_));
         let exceeded_network_failure = status
             .execution_info
             .as_mut()
@@ -179,7 +155,6 @@ where
             create_if_missing,
             processed_query_params: params,
             schema_generation,
-            manual_cache_name: manual_cache.map(|mc| mc.name),
         };
         let res = connectors.noria.execute_select(ctx, event).await;
         if status.execution_info.is_none() {
@@ -191,13 +166,8 @@ where
 
         match res {
             Ok(noria_ok) => {
-                // We managed to select on ReadySet, good for us. Don't promote the standard
-                // (fully autoparameterized) shape's status when the read was served by a manual
-                // cache: that shape has no deep cache of its own, so a stale `Successful` would
-                // make later queries attempt a non-existent view once the manual cache is dropped.
-                if !served_via_manual_cache {
-                    status.migration_state = MigrationState::Successful(CacheType::Deep);
-                }
+                // We managed to select on ReadySet, good for us.
+                status.migration_state = MigrationState::Successful(CacheType::Deep);
                 if let Some(i) = status.execution_info.as_mut() {
                     i.execute_succeeded()
                 }

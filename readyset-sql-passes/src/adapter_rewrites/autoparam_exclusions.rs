@@ -1,13 +1,11 @@
 //! Support for the `CREATE CACHE WITH (AUTOPARAM (EXCLUDE_*))` scopes: a pre-rewrite pass that
-//! marks literals in the excluded clause origins so autoparameterization keeps them inline, and
-//! the lockstep diff that derives the frozen positions from the rewritten forms.
+//! marks literals in the excluded clause origins so autoparameterization keeps them inline.
 //!
 //! # Disabled
 //!
 //! Nothing in the product calls this. A cache built from marked literals takes a form no read
-//! produces on its own, so reaching it needs every read rewritten into that form, and the
-//! reconciliation below only ever managed it for the forms it could verify were aligned. The
-//! pass and its tests stay as the starting point for reaching such a cache deliberately.
+//! produces on its own, so reaching it needs every read rewritten into that form. The pass and
+//! its tests stay as the starting point for doing that deliberately.
 //!
 //! The marking must happen before the rewrite pipeline runs because the unnest/hoist passes
 //! relocate predicates from `EXISTS`, `JOIN ON`, and subqueries into the top-level WHERE, erasing
@@ -17,8 +15,6 @@
 
 use std::mem;
 
-use readyset_errors::{ReadySetResult, unsupported};
-use readyset_sql::analysis::visit::{self, Visitor};
 use readyset_sql::analysis::visit_mut::{self, VisitorMut};
 use readyset_sql::ast::{
     AutoparamControl, BinaryOperator, Expr, InValue, JoinConstraint, Literal, SelectStatement,
@@ -132,84 +128,11 @@ impl<'ast> VisitorMut<'ast> for ExclusionWrapper {
     }
 }
 
-/// Derive the frozen positions for a manually parameterized cache by walking the rewritten
-/// standard (fully autoparameterized) and manual forms in lockstep.
-///
-/// Both forms come out of the same rewrite pipeline over the same source statement, so they
-/// should be structurally identical except at literal leaves: where the standard form has a
-/// placeholder and the manual form has a literal, that literal is frozen at the standard form's
-/// parameter position. The marker the manual form carries through the pipeline could in principle
-/// perturb a pass into reshaping it differently, so the structural identity is verified rather
-/// than assumed -- a mismatch yields an `unsupported` error, never a guessed position map.
-/// Comparing the verified-aligned forms makes the derivation exact even when the two passes'
-/// equals/range gating diverges or when equal literal values appear at several positions.
-pub fn derive_frozen(
-    standard: &SelectStatement,
-    manual: &SelectStatement,
-) -> ReadySetResult<Vec<(usize, Literal)>> {
-    // The lockstep pairing below assumes the two forms are structurally identical apart from the
-    // frozen literal leaves, so that the i-th literal of one corresponds to the i-th of the other.
-    // The exclusion pre-pass rewrites the manual form with `Literal::Preserved` markers in place,
-    // and that marker is value-distinct from its inner literal, so a dedup or ordering pass could
-    // act on it and reshape predicates differently from the standard form. Comparing literal
-    // skeletons (every literal blanked to a single value) catches any such divergence -- including
-    // an equal-count reordering that a length check alone would miss -- before we trust the
-    // pairing. On divergence we reject the cache rather than risk freezing a value against the
-    // wrong column. A user-facing limitation of AUTOPARAM, not an internal bug.
-    if literal_skeleton(standard) != literal_skeleton(manual) {
-        unsupported!(
-            "AUTOPARAM cannot build a cache for this query: the requested EXCLUDE options change \
-             how it rewrites, so incoming queries could not be matched to the cache reliably. \
-             Create the cache with AUTOPARAM OFF and write the placeholders explicitly instead."
-        );
-    }
-
-    // Structurally aligned, so the two literal walks visit corresponding positions in lockstep.
-    let standard_literals = collect_literals(standard);
-    let manual_literals = collect_literals(manual);
-    let mut frozen = vec![];
-    let mut standard_param_pos = 0_usize;
-    for (s, m) in standard_literals.into_iter().zip(manual_literals) {
-        match (s, m) {
-            (Literal::Placeholder(_), Literal::Placeholder(_)) => standard_param_pos += 1,
-            (Literal::Placeholder(_), m) => {
-                frozen.push((standard_param_pos, m));
-                standard_param_pos += 1;
-            }
-            (s, m) if s == m => {}
-            (_, _) => {
-                unsupported!(
-                    "AUTOPARAM cannot be applied to this query: excluding the selected clauses \
-                     changes how it rewrites. Rephrase the query or use fewer exclusions."
-                );
-            }
-        }
-    }
-    Ok(frozen)
-}
-
-/// A copy of `stmt` with every literal (placeholders included) blanked to a single canonical
-/// value. Two statements share a skeleton iff they have identical structure regardless of literal
-/// values, which is exactly the precondition [`derive_frozen`]'s positional pairing relies on.
-fn literal_skeleton(stmt: &SelectStatement) -> SelectStatement {
-    struct Blank;
-
-    impl<'ast> VisitorMut<'ast> for Blank {
-        type Error = std::convert::Infallible;
-
-        fn visit_literal(&mut self, literal: &'ast mut Literal) -> Result<(), Self::Error> {
-            *literal = Literal::Null;
-            Ok(())
-        }
-    }
-
-    let mut stmt = stmt.clone();
-    let Ok(()) = Blank.visit_select_statement(&mut stmt);
-    stmt
-}
-
 /// Collect every literal in the statement in visit order.
+#[cfg(test)]
 fn collect_literals(stmt: &SelectStatement) -> Vec<Literal> {
+    use readyset_sql::analysis::visit::{self, Visitor};
+
     struct CollectLiterals(Vec<Literal>);
 
     impl<'ast> Visitor<'ast> for CollectLiterals {
@@ -316,59 +239,5 @@ mod tests {
         // are not comparison operands.
         assert_eq!(wrapped_count(&stmt), 1, "{}", stmt.display(Dialect::MySQL));
         assert!(collect_literals(&stmt).contains(&Literal::Preserved(Box::new(3.into()))));
-    }
-
-    /// The lockstep diff pairs positions exactly even when equal literal values appear both
-    /// frozen and parameterized.
-    #[test]
-    fn derive_frozen_disambiguates_equal_values() {
-        // Standard form: both literals parameterized. Manual form: `x` kept inline.
-        let standard = parse("SELECT v FROM t WHERE x = ? AND y = ?");
-        let manual = parse("SELECT v FROM t WHERE x = 5 AND y = ?");
-        let frozen = derive_frozen(&standard, &manual).unwrap();
-        assert_eq!(frozen, vec![(0, 5.into())]);
-
-        // And the mirror case: `y` kept inline, same value.
-        let manual = parse("SELECT v FROM t WHERE x = ? AND y = 5");
-        let frozen = derive_frozen(&standard, &manual).unwrap();
-        assert_eq!(frozen, vec![(1, 5.into())]);
-    }
-
-    #[test]
-    fn derive_frozen_counts_shared_placeholders_and_literals() {
-        let standard = parse("SELECT v FROM t WHERE a = ? AND b = ? AND c = ? AND d = 'kept'");
-        let manual = parse("SELECT v FROM t WHERE a = ? AND b = 'frozen' AND c = ? AND d = 'kept'");
-        let frozen = derive_frozen(&standard, &manual).unwrap();
-        assert_eq!(frozen, vec![(1, "frozen".into())]);
-    }
-
-    #[test]
-    fn derive_frozen_rejects_divergent_forms() {
-        let standard = parse("SELECT v FROM t WHERE a = ?");
-        let manual = parse("SELECT v FROM t WHERE a = ? AND b = 1");
-        assert!(derive_frozen(&standard, &manual).is_err());
-
-        let standard = parse("SELECT v FROM t WHERE a = 1");
-        let manual = parse("SELECT v FROM t WHERE a = 2");
-        assert!(derive_frozen(&standard, &manual).is_err());
-    }
-
-    #[test]
-    fn derive_frozen_rejects_equal_count_reordering() {
-        // Equal literal count, but the manual form's predicates are reordered (column `b` first).
-        // Pairing literals positionally would freeze `b`'s value against `a`'s placeholder slot --
-        // a wrong-context match. A length check passes here; the skeleton guard rejects it.
-        //
-        // These forms are hand-built. The rewrite passes preserve predicate order today (see
-        // probe_exclude_forms_alignment_through_pipeline in adapter_rewrites tests), so this
-        // guards the alignment invariant against future order-affecting passes rather than
-        // fixing a currently reachable misroute.
-        let standard = parse("SELECT v FROM t WHERE a = ? AND b = ?");
-        let manual = parse("SELECT v FROM t WHERE b = 5 AND a = ?");
-        assert_eq!(
-            collect_literals(&standard).len(),
-            collect_literals(&manual).len()
-        );
-        assert!(derive_frozen(&standard, &manual).is_err());
     }
 }

@@ -254,7 +254,7 @@ impl MigrationHandler {
         {
             Ok(rewrite_context) => {
                 self.noria
-                    .prepare_select(view_request.statement.clone(), true, &rewrite_context, None)
+                    .prepare_select(view_request.statement.clone(), true, &rewrite_context)
                     .await
             }
             Err(e) => Err(e),

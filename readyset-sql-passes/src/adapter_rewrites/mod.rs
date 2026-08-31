@@ -7,12 +7,12 @@ use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::{iter, mem};
 
-pub use autoparam_exclusions::{derive_frozen, wrap_autoparam_exclusions};
+pub use autoparam_exclusions::wrap_autoparam_exclusions;
 pub use autoparameterize::auto_parameterize_query;
 use itertools::{Either, Itertools, repeat_n};
 use readyset_data::{Collation, DfType, DfValue};
 use readyset_errors::{
-    ReadySetError, ReadySetResult, internal, internal_err, invalid_query_err, unsupported,
+    ReadySetError, ReadySetResult, internal_err, invalid_query_err, unsupported,
 };
 use readyset_sql::analysis::visit_mut::{self, VisitorMut};
 use readyset_sql::ast::{
@@ -70,12 +70,6 @@ pub struct DfQueryParameters {
     auto_parameters: Vec<(usize, Literal)>,
     pagination_parameters: AdapterPaginationParams,
     post_lookup_plan: PostLookupPlan,
-    /// When this query is served by a manually parameterized cache (`CREATE CACHE WITH
-    /// (AUTOPARAM ...)`), the cache's inline literals by position in this query's merged
-    /// parameter order; verified and stripped from each lookup key by [`Self::apply_frozen`].
-    /// Empty for ordinary queries (no manual cache) -- creation never registers a mapping with
-    /// an empty frozen set, so a non-empty value uniquely marks a manual-cache query.
-    frozen: Vec<(usize, Literal)>,
 }
 
 /// Information about parameters from a query, which allows converting a parameter list into a
@@ -488,7 +482,6 @@ pub fn rewrite_for_readyset(
             force_paginate_in_adapter,
         },
         post_lookup_plan,
-        frozen: Vec::new(),
     })
 }
 
@@ -867,70 +860,6 @@ impl DfQueryParameters {
     /// Whether any IN conditions were collapsed into parameterized equality conditions.
     pub fn has_rewritten_in_conditions(&self) -> bool {
         !self.rewritten_in_conditions.is_empty()
-    }
-
-    /// Mark this query as served by a manually parameterized cache (`CREATE CACHE WITH
-    /// (AUTOPARAM ...)`). `frozen` holds the cache's inline literals by position in this query's
-    /// merged parameter order; [`Self::apply_frozen`] enforces them at execute time.
-    pub fn set_frozen(&mut self, frozen: Vec<(usize, Literal)>) {
-        self.frozen = frozen;
-    }
-
-    /// When this query is served by a manually parameterized cache, verify that each key's values
-    /// at the frozen positions equal the cache's inline literals, and strip those positions so
-    /// each key is in the manual cache's parameter order. Returns `Ok(None)` when a value
-    /// differs: the cache is specialized on different constants and cannot serve this execution,
-    /// so callers must treat it as a cache miss. No-op when no frozen literals are set.
-    pub fn apply_frozen<'param, T>(
-        &self,
-        keys: Vec<Cow<'param, [T]>>,
-    ) -> ReadySetResult<Option<Vec<Cow<'param, [T]>>>>
-    where
-        T: Clone + TryFromDialect<Literal> + Debug + PartialEq,
-    {
-        if self.frozen.is_empty() {
-            return Ok(Some(keys));
-        }
-        let expected = self
-            .frozen
-            .iter()
-            .map(|(i, lit)| -> ReadySetResult<(usize, T)> {
-                Ok((*i, lit.clone().try_into_dialect(self.dialect)?))
-            })
-            .collect::<ReadySetResult<Vec<_>>>()?;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            for (i, value) in &expected {
-                match key.get(*i) {
-                    Some(v) if v == value => {}
-                    Some(_) => return Ok(None),
-                    None => internal!(
-                        "frozen parameter index {i} out of bounds for key of length {}",
-                        key.len()
-                    ),
-                }
-            }
-            let reduced = key
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !expected.iter().any(|(fi, _)| fi == i))
-                .map(|(_, v)| v.clone())
-                .collect::<Vec<_>>();
-            out.push(Cow::Owned(reduced));
-        }
-        Ok(Some(out))
-    }
-
-    /// Whether a manually parameterized cache can serve this execution: `true` when no frozen
-    /// literals are set, or when every frozen position's value (in the merged lookup key built
-    /// from `params`) equals the cache's inline literal. Lets callers route a non-matching query
-    /// cleanly upstream instead of attempting the cache and treating the decline as a failure.
-    pub fn frozen_satisfied(&self, params: &[DfValue]) -> ReadySetResult<bool> {
-        if self.frozen.is_empty() {
-            return Ok(true);
-        }
-        let keys = self.make_keys(params)?;
-        Ok(self.apply_frozen(keys)?.is_some())
     }
 }
 
@@ -2264,85 +2193,26 @@ mod tests {
             );
         }
 
-        /// After the full pipeline (unnest included), the supported EXCLUDE_EXISTS query's standard
-        /// and manual forms stay structurally aligned, so the guard in `derive_frozen` accepts them
-        /// and derives exactly the one frozen literal. Regression guard that the alignment check
-        /// does not reject the supported case.
+        /// EXCLUDE_* scopes keep their literals inline all the way through the pipeline, and the
+        /// marker that carries them there never survives into the rewritten form.
         #[test]
-        fn derive_frozen_through_full_pipeline_excludes_exists() {
-            use readyset_sql::ast::AutoparamControl;
-
-            let query = "SELECT id FROM users WHERE id = 3 AND EXISTS \
-                         (SELECT 1 FROM t WHERE t.x = users.id AND t.y = 'frozen')";
-
-            let mut standard = parse_select_statement(query, Dialect::PostgreSQL);
-            rewrite_query(
-                &mut standard,
-                rewrite_params(Dialect::PostgreSQL),
-                rewrite_context(Dialect::PostgreSQL),
-            )
-            .unwrap();
-
-            let mut manual = parse_select_statement(query, Dialect::PostgreSQL);
-            wrap_autoparam_exclusions(
-                &mut manual,
-                &AutoparamControl {
-                    exclude_exists: true,
-                    ..Default::default()
-                },
-            );
-            rewrite_query(
-                &mut manual,
-                rewrite_params(Dialect::PostgreSQL),
-                rewrite_context(Dialect::PostgreSQL),
-            )
-            .unwrap();
-
-            let frozen =
-                derive_frozen(&standard, &manual).expect("aligned forms must not be rejected");
-            assert_eq!(
-                frozen.len(),
-                1,
-                "only the EXISTS literal is frozen: {frozen:?}"
-            );
-            assert_eq!(frozen[0].1, Literal::String("frozen".into()));
-        }
-
-        /// Falsification probe: drive a battery of adversarial EXCLUDE queries through the REAL
-        /// pipeline and check, independently of `derive_frozen`'s own guard, whether the standard
-        /// (bare -> all parameterized) and manual (Preserved-wrapped -> excluded literals frozen)
-        /// forms ever come out with EQUAL literal count but DIFFERENT structure. That is the only
-        /// shape that would make positional pairing freeze a value against the wrong column. If
-        /// this test fails, the equal-count reordering bug is reachable through the pipeline.
-        #[test]
-        fn probe_exclude_forms_alignment_through_pipeline() {
+        fn exclusions_keep_literals_and_leak_no_marker() {
             use readyset_sql::analysis::visit::Visitor;
-            use readyset_sql::analysis::visit_mut::VisitorMut;
             use readyset_sql::ast::AutoparamControl;
 
-            fn skeleton(stmt: &SelectStatement) -> SelectStatement {
-                struct Blank;
-                impl<'ast> VisitorMut<'ast> for Blank {
+            /// How many literals the statement holds that are not placeholders.
+            fn inline_literals(stmt: &SelectStatement) -> usize {
+                struct Count(usize);
+                impl<'ast> Visitor<'ast> for Count {
                     type Error = std::convert::Infallible;
-                    fn visit_literal(&mut self, l: &'ast mut Literal) -> Result<(), Self::Error> {
-                        *l = Literal::Null;
+                    fn visit_literal(&mut self, l: &'ast Literal) -> Result<(), Self::Error> {
+                        if !matches!(l, Literal::Placeholder(_)) {
+                            self.0 += 1;
+                        }
                         Ok(())
                     }
                 }
-                let mut s = stmt.clone();
-                let Ok(()) = Blank.visit_select_statement(&mut s);
-                s
-            }
-            fn count_literals(stmt: &SelectStatement) -> usize {
-                struct C(usize);
-                impl<'ast> Visitor<'ast> for C {
-                    type Error = std::convert::Infallible;
-                    fn visit_literal(&mut self, _l: &'ast Literal) -> Result<(), Self::Error> {
-                        self.0 += 1;
-                        Ok(())
-                    }
-                }
-                let mut c = C(0);
+                let mut c = Count(0);
                 let Ok(()) = Visitor::visit_select_statement(&mut c, stmt);
                 c.0
             }
@@ -2423,119 +2293,44 @@ mod tests {
                  WHERE d.x = 1",
             ];
 
-            let mut equal_count_divergences: Vec<&str> = vec![];
-            let mut reports: Vec<String> = vec![];
+            let mut checked = 0;
             for q in queries {
-                let mut std_ast = parse_select_statement(q, Dialect::PostgreSQL);
-                let std_res = rewrite_query(
-                    &mut std_ast,
+                let mut plain = parse_select_statement(q, Dialect::PostgreSQL);
+                let plain_ok = rewrite_query(
+                    &mut plain,
                     rewrite_params(Dialect::PostgreSQL),
                     rewrite_context(Dialect::PostgreSQL),
-                );
-                let mut man_ast = parse_select_statement(q, Dialect::PostgreSQL);
-                wrap_autoparam_exclusions(&mut man_ast, &exclude_all);
-                let man_res = rewrite_query(
-                    &mut man_ast,
+                )
+                .is_ok();
+
+                let mut excluded = parse_select_statement(q, Dialect::PostgreSQL);
+                wrap_autoparam_exclusions(&mut excluded, &exclude_all);
+                let excluded_ok = rewrite_query(
+                    &mut excluded,
                     rewrite_params(Dialect::PostgreSQL),
                     rewrite_context(Dialect::PostgreSQL),
-                );
-                match (std_res, man_res) {
-                    (Ok(_), Ok(_)) => {
-                        let sc = count_literals(&std_ast);
-                        let mc = count_literals(&man_ast);
-                        let aligned = skeleton(&std_ast) == skeleton(&man_ast);
-                        let frozen = derive_frozen(&std_ast, &man_ast);
-                        assert_eq!(
-                            aligned,
-                            frozen.is_ok(),
-                            "derive_frozen must accept exactly the aligned forms: {q}"
-                        );
-                        let status = if aligned {
-                            "ALIGNED"
-                        } else if sc == mc {
-                            equal_count_divergences.push(q);
-                            "EQUAL-COUNT-DIVERGENCE"
-                        } else {
-                            "count-diff"
-                        };
-                        reports.push(format!(
-                            "{status:>22}  std_lits={sc} man_lits={mc} frozen={:?}  {q}",
-                            frozen.map(|f| f.len()).map_err(|_| "rejected")
-                        ));
-                    }
-                    (s, m) => reports.push(format!(
-                        "{:>22}  std_err={} man_err={}  {q}",
-                        "REWRITE-ERR",
-                        s.is_err(),
-                        m.is_err()
-                    )),
+                )
+                .is_ok();
+
+                if !plain_ok || !excluded_ok {
+                    continue;
                 }
+                checked += 1;
+                assert!(
+                    !format!("{excluded:?}").contains("Preserved"),
+                    "a marker survived the rewrite: {q}"
+                );
+                assert!(
+                    inline_literals(&excluded) >= inline_literals(&plain),
+                    "excluding a scope has to keep at least as many literals inline: {q}\n                       plain:    {}\n  excluded: {}",
+                    plain.display(Dialect::PostgreSQL),
+                    excluded.display(Dialect::PostgreSQL),
+                );
             }
             assert!(
-                equal_count_divergences.is_empty(),
-                "equal-count divergence(s) found -- the reordering bug IS reachable through the \
-                 pipeline:\n{}",
-                reports.join("\n")
+                checked > 20,
+                "only {checked} queries reached the assertions; the corpus has gone dark"
             );
-            println!("{}", reports.join("\n"));
-        }
-
-        /// `apply_frozen` verifies the incoming values at frozen positions against the manual
-        /// cache's inline literals and strips them from the key; a differing value is a miss.
-        #[test]
-        fn apply_frozen_verifies_and_reduces_keys() {
-            // Ad-hoc query: both literals are autoparameterized; the manual cache froze
-            // `credit_card_number = 'frozen'`, so position 0 is frozen and `id` is the real key.
-            let mut query = parse_select_statement(
-                "SELECT id FROM users WHERE credit_card_number = 'frozen' AND id = 7",
-                Dialect::PostgreSQL,
-            );
-            let mut processed = rewrite_query(
-                &mut query,
-                rewrite_params(Dialect::PostgreSQL),
-                rewrite_context(Dialect::PostgreSQL),
-            )
-            .unwrap();
-            // The standard rewrite extracted both literals at positions 0 and 1.
-            assert_eq!(processed.auto_parameters().len(), 2);
-
-            processed.set_frozen(vec![(0, Literal::String("frozen".into()))]);
-
-            // Matching frozen value: key reduces to just `id`.
-            let keys = processed.make_keys::<DfValue>(&[]).unwrap();
-            let reduced = processed.apply_frozen(keys).unwrap().expect("should match");
-            assert_eq!(reduced, vec![Cow::<[DfValue]>::Owned(vec![7.into()])]);
-
-            // Mismatching frozen value: cache miss.
-            let mut other = parse_select_statement(
-                "SELECT id FROM users WHERE credit_card_number = 'other' AND id = 7",
-                Dialect::PostgreSQL,
-            );
-            let mut processed_other = rewrite_query(
-                &mut other,
-                rewrite_params(Dialect::PostgreSQL),
-                rewrite_context(Dialect::PostgreSQL),
-            )
-            .unwrap();
-            processed_other.set_frozen(vec![(0, Literal::String("frozen".into()))]);
-            let keys = processed_other.make_keys::<DfValue>(&[]).unwrap();
-            assert!(processed_other.apply_frozen(keys).unwrap().is_none());
-        }
-
-        /// Without frozen literals set, `apply_frozen` passes keys through untouched.
-        #[test]
-        fn apply_frozen_is_noop_without_frozen() {
-            let mut query =
-                parse_select_statement("SELECT id FROM users WHERE id = 7", Dialect::PostgreSQL);
-            let processed = rewrite_query(
-                &mut query,
-                rewrite_params(Dialect::PostgreSQL),
-                rewrite_context(Dialect::PostgreSQL),
-            )
-            .unwrap();
-            let keys = processed.make_keys::<DfValue>(&[]).unwrap();
-            let out = processed.apply_frozen(keys.clone()).unwrap().unwrap();
-            assert_eq!(out, keys);
         }
 
         /// `AUTOPARAM OFF` only suppresses autoparameterization; the rest of the pass (here,

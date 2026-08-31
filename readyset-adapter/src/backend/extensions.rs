@@ -54,7 +54,6 @@ use super::{
     acl_creator, readyset_version, resolve_coalesce, resolve_eviction_policy,
 };
 use crate::cache_acl::{AclMessage, CacheCreator, PassTrigger};
-use crate::query_status_cache::ManualCacheEntry;
 use crate::utils::create_dummy_column;
 use crate::{QueryHandler, UpstreamDatabase, create_dummy_schema};
 
@@ -168,38 +167,11 @@ where
         concurrently: bool,
         topk_buffer_multiplier: Option<usize>,
         schema_generation: SchemaGeneration,
-        manual_mapping: Option<ManualMappingInfo>,
         mut ddl_req: Option<CacheDDLRequest>,
         quiet: bool,
     ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
         let deep = deep?;
         let (query_id, name) = Self::resolve_id_and_name(name, QueryId::from(&deep));
-
-        // A manually parameterized cache owns its standard (fully autoparameterized) shape
-        // exclusively: reject the creation up front when a different manual cache already
-        // claims it, so incoming SELECTs are never routed ambiguously.
-        let manual_registration = manual_mapping
-            .map(|info| {
-                let lookup_id = QueryId::from(&info.lookup);
-                let entry = ManualCacheEntry {
-                    name: name.clone(),
-                    manual: deep.clone(),
-                    frozen: info.frozen,
-                };
-                match state.query_status_cache.manual_cache(&lookup_id) {
-                    Some(existing) if existing.manual != entry.manual => {
-                        Err(ReadySetError::CreateCacheError(format!(
-                            "manually parameterized cache {} already serves this query's \
-                             auto-parameterized shape. DROP CACHE {}, or add more parameters \
-                             so the shapes differ",
-                            existing.name.display_unquoted(),
-                            existing.name.display_unquoted(),
-                        )))
-                    }
-                    _ => Ok((lookup_id, entry)),
-                }
-            })
-            .transpose()?;
 
         if let Some(req) = &mut ddl_req {
             req.cache_name = Some(name.clone());
@@ -225,19 +197,6 @@ where
             schema_generation,
         )
         .await;
-
-        if res.is_ok()
-            && let Some((lookup_id, entry)) = manual_registration
-            && let Err(existing) = state
-                .query_status_cache
-                .insert_manual_cache(lookup_id, entry)
-        {
-            // Pre-checked above; only a concurrent CREATE CACHE can race us here.
-            warn!(
-                existing = %existing.name.display_unquoted(),
-                "manual cache mapping already claimed concurrently"
-            );
-        }
 
         remove_ddl_on_error(
             &res,
@@ -510,10 +469,7 @@ where
         Ok(*cache_type)
     }
 
-    /// Extract the deep and shallow representations of the query. When autoparameterization is
-    /// suppressed or scoped (`AUTOPARAM OFF` / `AUTOPARAM (EXCLUDE_*)`), also computes the
-    /// [`ManualMappingInfo`] that routes incoming SELECTs (which still autoparameterize fully)
-    /// to the manually parameterized cache.
+    /// Extract the deep and shallow representations of the query.
     #[allow(clippy::type_complexity)]
     async fn query_from_cache_inner(
         connectors: &BackendConnectors<DB>,
@@ -525,7 +481,6 @@ where
         ReadySetResult<ViewCreateRequest>,
         ReadySetResult<ShallowViewRequest>,
         SchemaGeneration,
-        Option<ManualMappingInfo>,
     )> {
         match inner {
             CacheInner::Statement { deep, shallow } => {
@@ -536,7 +491,6 @@ where
                 let rewrite_context =
                     Self::rewrite_context(connectors, settings, state, None).await?;
                 let schema_generation = rewrite_context.schema_generation();
-                let mut manual_mapping = None;
                 let deep = if settings.cache_mode.is_shallow() {
                     Err(ReadySetError::Unsupported("shallow-only mode".into()))
                 } else {
@@ -545,54 +499,17 @@ where
                     let mut rewrite_params = connectors.noria.rewrite_params();
                     rewrite_params.autoparameterize = !autoparam.off;
                     match deep {
-                        Ok(mut deep) => {
-                            let standard_src = (!autoparam.is_default()).then(|| (*deep).clone());
-                            match adapter_rewrites::rewrite_query(
-                                &mut deep,
-                                rewrite_params,
-                                &rewrite_context,
-                            ) {
-                                Ok(_params) => {
-                                    if let Some(mut standard) = standard_src {
-                                        let params = adapter_rewrites::rewrite_query(
-                                            &mut standard,
-                                            connectors.noria.rewrite_params(),
-                                            &rewrite_context,
-                                        )?;
-                                        let frozen =
-                                            adapter_rewrites::derive_frozen(&standard, &deep)?;
-                                        // With nothing frozen the two forms agree and the
-                                        // regular lookup path already finds the cache.
-                                        if !frozen.is_empty() {
-                                            if params.has_rewritten_in_conditions() {
-                                                unsupported!(
-                                                    "AUTOPARAM is not supported for queries \
-                                                     whose IN clauses would be autoparameterized"
-                                                );
-                                            }
-                                            if standard.limit_clause != deep.limit_clause {
-                                                unsupported!(
-                                                    "AUTOPARAM is not supported when LIMIT or \
-                                                     OFFSET would be autoparameterized"
-                                                );
-                                            }
-                                            manual_mapping = Some(ManualMappingInfo {
-                                                lookup: ViewCreateRequest::new(
-                                                    standard,
-                                                    rewrite_context.search_path().to_owned(),
-                                                ),
-                                                frozen,
-                                            });
-                                        }
-                                    }
-                                    Ok(ViewCreateRequest::new(
-                                        *deep,
-                                        rewrite_context.search_path().to_owned(),
-                                    ))
-                                }
-                                Err(e) => Err(e),
-                            }
-                        }
+                        Ok(mut deep) => match adapter_rewrites::rewrite_query(
+                            &mut deep,
+                            rewrite_params,
+                            &rewrite_context,
+                        ) {
+                            Ok(_params) => Ok(ViewCreateRequest::new(
+                                *deep,
+                                rewrite_context.search_path().to_owned(),
+                            )),
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(ReadySetError::UnparseableQuery(e)),
                     }
                 };
@@ -612,7 +529,7 @@ where
                     Err(e) => Err(ReadySetError::UnparseableQuery(e)),
                 };
 
-                Ok((deep, shallow, schema_generation, manual_mapping))
+                Ok((deep, shallow, schema_generation))
             }
             CacheInner::Id(id) => match state
                 .query_status_cache
@@ -630,7 +547,6 @@ where
                             Ok((*deep).clone()),
                             Err(ReadySetError::NoQueryForId { id: id.to_string() }),
                             generation,
-                            None,
                         ))
                     }
                     Query::ShallowParsed(shallow) => {
@@ -642,7 +558,6 @@ where
                             Err(ReadySetError::NoQueryForId { id: id.to_string() }),
                             Ok((*shallow).clone()),
                             generation,
-                            None,
                         ))
                     }
                     Query::ParseFailed(_, e) => Err(ReadySetError::UnparseableQuery(e)),
@@ -667,10 +582,7 @@ where
             internal!("Unexpected EXPLAIN: {explain:?}");
         };
 
-        let (deep, shallow, schema_generation, _) =
-            Self::query_from_cache_inner(connectors, settings, state, inner, Default::default())
-                .await?;
-        Ok((deep, shallow, schema_generation))
+        Self::query_from_cache_inner(connectors, settings, state, inner, Default::default()).await
     }
 
     // Determine the migration state of the deep representation, performing a dry run if necessary.
@@ -879,8 +791,6 @@ where
         if let Some(view_request) = maybe_view_request {
             state.drop_view_request(&view_request);
         }
-        // A dropped manually parameterized cache must stop capturing its standard shape.
-        state.query_status_cache.remove_manual_cache_by_name(name);
         Ok(noria_connector::QueryResult::Delete {
             num_rows_deleted: result,
         })
@@ -919,7 +829,6 @@ where
         if matches!(cache_type, Some(CacheType::Deep) | None) {
             state.authority.remove_all_cache_ddl_requests().await?;
             connectors.noria.drop_all_caches().await?;
-            state.query_status_cache.clear_manual_caches();
         }
         if matches!(cache_type, Some(CacheType::Shallow) | None) {
             state
@@ -1625,7 +1534,7 @@ where
                     topk_buffer_multiplier,
                     autoparam,
                 } = create_cache_stmt;
-                let (deep, shallow, schema_generation, manual_mapping) =
+                let (deep, shallow, schema_generation) =
                     Self::query_from_cache_inner(connectors, settings, state, inner, *autoparam)
                         .await?;
 
@@ -1668,7 +1577,6 @@ where
                         *concurrently,
                         *topk_buffer_multiplier,
                         schema_generation,
-                        manual_mapping,
                         ddl_req,
                         false,
                     )
@@ -1700,7 +1608,6 @@ where
                         *concurrently,
                         *topk_buffer_multiplier,
                         schema_generation,
-                        manual_mapping,
                         ddl_req.clone(),
                         true,
                     )
@@ -2026,16 +1933,6 @@ where
             vec![Results::new(results)],
         ))
     }
-}
-
-/// Mapping data computed while creating a deep cache with autoparameterization suppressed
-/// (`CREATE CACHE WITH (AUTOPARAM ...)`): the standard (fully autoparameterized) form of the
-/// query, which is the shape incoming SELECTs hash to, and the literals the manual form keeps
-/// inline (by position in the standard form's merged parameter order).
-#[derive(Debug, Clone)]
-struct ManualMappingInfo {
-    lookup: ViewCreateRequest,
-    frozen: Vec<(usize, ast::Literal)>,
 }
 
 /// Remove a DDL request from authority when cache creation fails.

@@ -220,25 +220,11 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
                             .all(|e| matches!( e, Expr::Literal(lit) if !matches!(lit, Literal::Placeholder(_)))) =>
                     {
                         if self.autoparameterize_equals {
-                            let exprs = mem::replace(
-                                exprs,
-                                std::iter::repeat_n(
-                                    Expr::Literal(Literal::Placeholder(ItemPlaceholder::QuestionMark)),
-                                    exprs.len(),
-                                )
-                                .collect(),
-                            );
-                            let num_exprs = exprs.len();
-                            let start_index = self.param_index;
-                            self.out
-                                .extend(exprs.into_iter().enumerate().filter_map(move |(i, expr)| match expr {
-                                    Expr::Literal(lit) => Some((i + start_index, lit)),
-                                    // unreachable since we checked everything in the list is a
-                                    // literal above, but best
-                                    // not to panic regardless
-                                    _ => None,
-                                }));
-                            self.param_index += num_exprs;
+                            for expr in exprs.iter_mut() {
+                                if let Expr::Literal(lit) = expr {
+                                    self.replace_literal(lit);
+                                }
+                            }
                         }
                         return Ok(());
                     }
@@ -273,59 +259,18 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
                                 );
                             };
 
-                            let exprs = mem::replace(
-                                exprs,
-                                exprs
-                                    .iter()
-                                    .map(|e| -> Result<Expr, ReadySetError> {
-                                        match e {
-                                            Expr::Row { exprs, .. } => Ok(Expr::Row {
-                                                exprs: std::iter::repeat_n(
-                                                    Expr::Literal(Literal::Placeholder(ItemPlaceholder::QuestionMark)),
-                                                    exprs.len(),
-                                                )
-                                                .collect(),
-                                                explicit: false,
-                                            }),
-                                            // ideally, this should be fully checked by the guard
-                                            // above, unfortunately, it's not because of the workaround
-                                            // mentioned above
-                                            _ => unsupported!("Expected a ROW of placeholders"),
-                                        }
-                                    })
-                                    .collect::<ReadySetResult<Vec<_>>>()?,
-                            );
-
-                            // same as the error above
-                            let num_exprs: usize = exprs
-                                .iter()
-                                .map(|e| match e {
-                                    Expr::Row { exprs, .. } => Ok(exprs.len()),
-                                    _ => unsupported!("Expected a ROW of placeholders"),
-                                })
-                                .collect::<ReadySetResult<Vec<_>>>()?
-                                .into_iter()
-                                .sum();
-
-                            let start_index = self.param_index;
-                            let param_offset = 0;
-
-                            self.out.extend(
-                                exprs
-                                    .into_iter()
-                                    .flat_map(|e| match e {
-                                        Expr::Row { exprs, .. } => exprs,
-                                        _ => unreachable!(), // checked above
-                                    })
-                                    .enumerate()
-                                    .map(|(i, e)| match e {
-                                        Expr::Literal(lit) => Ok((start_index + param_offset + i, lit)),
-                                        _ => unsupported!("Expected ROWs to only contain Literals"),
-                                    })
-                                    .collect::<ReadySetResult<Vec<_>>>()?,
-                            );
-
-                            self.param_index += num_exprs;
+                            for row in exprs.iter_mut() {
+                                // The guard admits only rows, apart from the parse workaround
+                                // just applied.
+                                let Expr::Row { exprs, .. } = row else {
+                                    unsupported!("Expected a ROW of literals");
+                                };
+                                for expr in exprs.iter_mut() {
+                                    if let Expr::Literal(lit) = expr {
+                                        self.replace_literal(lit);
+                                    }
+                                }
+                            }
                         }
                         return Ok(());
                     }
@@ -346,7 +291,10 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
             && self.autoparameterize_equals
             && self.query_depth <= 1
         {
+            // `replace_literal` has accounted for this literal, so the walk stops here rather
+            // than reaching the placeholder it just wrote and counting it a second time.
             self.replace_literal(offset);
+            return Ok(());
         }
 
         visit_mut::walk_offset(self, offset)
@@ -569,9 +517,10 @@ pub fn auto_parameterize_query(
             // If the query contains no placeholderse, we try to autoparameterize the equals
             // comparisons only, since we don't support mixed comparisons yet
             (false, false) => (true, false),
-            // If the query contains equal and range placeholders, we bail, since we don't support
-            // mixed comparisons yet
-            (true, true) => return Ok(vec![]),
+            // A query that already mixes equal and range placeholders gets neither, since we
+            // don't support mixed comparisons yet. The walk still runs, so the parameters the
+            // caller passed in survive it.
+            (true, true) => (false, false),
         }
     };
 

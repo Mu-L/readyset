@@ -40,7 +40,6 @@ use super::{
     parse_shallow_query,
 };
 use crate::query_handler::UpstreamSetRewrite;
-use crate::query_status_cache::ManualCacheEntry;
 use crate::session_mutation::{self, SessionMutationTemplate};
 use crate::upstream_database::UpstreamPrepare;
 use crate::{QueryHandler, UpstreamDatabase};
@@ -80,9 +79,6 @@ struct PrepareSelectMeta {
     must_migrate: bool,
     should_do_noria: bool,
     trx_cache_policy: TrxCachePolicy,
-    /// Set when the query's standard shape maps to a manually parameterized cache
-    /// (`CREATE CACHE WITH (AUTOPARAM ...)`): the SELECT is served by that cache instead.
-    manual_cache: Option<ManualCacheEntry>,
 }
 
 #[derive(Debug)]
@@ -376,7 +372,6 @@ where
                 select_meta.stmt.clone(),
                 select_meta.must_migrate,
                 &rewrite_context,
-                select_meta.manual_cache.as_ref(),
             ))
             .into();
 
@@ -397,21 +392,13 @@ where
 
         // Update noria migration state for query
         match &noria_res {
-            // Don't promote the standard (fully autoparameterized) shape when this prepare was
-            // served by a manual cache (`AUTOPARAM`): that shape has no deep cache of its own, so
-            // a stale `Successful` would make later queries attempt a non-existent view once the
-            // manual cache is dropped.
-            Some(Ok(noria_connector::PrepareResult::Select { .. }))
-                if select_meta.manual_cache.is_none() =>
-            {
+            Some(Ok(noria_connector::PrepareResult::Select { .. })) => {
                 self.state.query_status_cache.update_query_migration_state(
                     &select_meta.view_request,
                     MigrationState::Successful(CacheType::Deep),
                     None,
                 );
             }
-            // Manual-cache prepare: routed by the standard shape's mapping, leave its status alone.
-            Some(Ok(noria_connector::PrepareResult::Select { .. })) => {}
             Some(Err(e)) => {
                 if e.caused_by_view_not_found() {
                     debug!(error = %e, "View not found during mirror_prepare()");
@@ -631,14 +618,7 @@ where
             Ok(PrepareMeta::Proxy)
         } else {
             let query_id = QueryId::from(&view_request);
-            // A manually parameterized cache (`AUTOPARAM`) claiming this query's standard shape
-            // serves the SELECT, regardless of the standard shape's own migration state.
-            let manual_cache = self.state.query_status_cache.manual_cache(&query_id);
-            let migration_state = if manual_cache.is_some() {
-                MigrationState::Successful(CacheType::Deep)
-            } else {
-                status.migration_state
-            };
+            let migration_state = status.migration_state;
             let should_do_readyset = !matches!(migration_state, MigrationState::Unsupported(_));
             Ok(PrepareMeta::Select(PrepareSelectMeta {
                 stmt,
@@ -651,7 +631,6 @@ where
                     || !self.connectors.has_fallback(),
                 should_do_noria: should_do_readyset,
                 trx_cache_policy: status.trx_cache_policy,
-                manual_cache,
             }))
         }
     }
@@ -735,7 +714,6 @@ where
                     must_migrate: false,
                     should_do_noria: false,
                     trx_cache_policy: TrxCachePolicy::Never,
-                    manual_cache: None,
                 })
             }
             Ok(SqlQuery::Select(stmt)) => self.plan_prepare_select(stmt, is_skip_cache).await?,
@@ -1168,7 +1146,6 @@ where
         noria: &mut NoriaConnector,
         cached_entry: &mut PreparedStatement<DB>,
         rewrite_context: &RewriteContext,
-        manual_cache: Option<&ManualCacheEntry>,
     ) -> ReadySetResult<()> {
         debug_assert!(
             cached_entry.migration_state.is_pending() || cached_entry.migration_state.is_inlined()
@@ -1187,7 +1164,7 @@ where
         let noria_prep = match &**parsed_statement {
             SqlQuery::Select(stmt) => {
                 noria
-                    .prepare_select(stmt.clone(), false, rewrite_context, manual_cache)
+                    .prepare_select(stmt.clone(), false, rewrite_context)
                     .await?
             }
             _ => internal!("Only SELECT statements can be pending migration"),
@@ -1274,15 +1251,10 @@ where
             // Use try_query_migration_state (read-only) rather than query_migration_state
             // to avoid overwriting the stored schema generation. The generation was set
             // at prepare time and must not be updated to the current generation here.
-            let (query_id, new_migration_state) = self
+            let (_query_id, new_migration_state) = self
                 .state
                 .query_status_cache
                 .try_query_migration_state(cached_statement.as_view_request()?);
-
-            // A manually parameterized cache (`AUTOPARAM`) created after this statement was
-            // prepared claims its standard shape; route to it even though the shape's own
-            // migration state never transitions to Successful.
-            let manual_cache = self.state.query_status_cache.manual_cache(&query_id);
 
             let search_path = cached_statement
                 .view_request
@@ -1296,17 +1268,9 @@ where
                 search_path,
             );
 
-            if manual_cache.is_some()
-                || matches!(new_migration_state, Some(MigrationState::Successful(_)))
-            {
+            if matches!(new_migration_state, Some(MigrationState::Successful(_))) {
                 // Attempt to prepare on ReadySet
-                let _ = Self::update_noria_prepare(
-                    noria,
-                    cached_statement,
-                    &rewrite_context,
-                    manual_cache.as_ref(),
-                )
-                .await;
+                let _ = Self::update_noria_prepare(noria, cached_statement, &rewrite_context).await;
             } else if let Some(MigrationState::Inlined(new_state)) = new_migration_state
                 && let MigrationState::Inlined(ref old_state) = cached_statement.migration_state
             {
@@ -1333,14 +1297,9 @@ where
                     if updated_view_cache
                         && matches!(cached_statement.prep.inner, PrepareResultInner::Upstream(_))
                     {
-                        if Self::update_noria_prepare(
-                            noria,
-                            cached_statement,
-                            &rewrite_context,
-                            None,
-                        )
-                        .await
-                        .is_ok()
+                        if Self::update_noria_prepare(noria, cached_statement, &rewrite_context)
+                            .await
+                            .is_ok()
                         {
                             cached_statement.migration_state = MigrationState::Inlined(new_state);
                         }
@@ -1453,25 +1412,6 @@ where
             | PrepareResultInner::Shallow(uprep)
                 if should_fallback =>
             {
-                Self::execute_upstream(
-                    Self::upstream_mut(upstream)?,
-                    uprep,
-                    params,
-                    exec_meta,
-                    None,
-                    &mut event,
-                    false,
-                    None,
-                )
-                .await
-            }
-            PrepareResultInner::NoriaAndUpstream(nprep, uprep)
-                if !nprep.frozen_satisfied(params)? =>
-            {
-                // A manually parameterized cache (`AUTOPARAM`) backs this statement, but its
-                // frozen literals don't match these params: the query isn't served by the cache,
-                // so go straight upstream as a clean miss rather than attempting (and declining)
-                // the readyset read.
                 Self::execute_upstream(
                     Self::upstream_mut(upstream)?,
                     uprep,
