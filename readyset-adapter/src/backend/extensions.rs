@@ -497,7 +497,29 @@ where
                     // The option decides the form the cache takes: `OFF` builds it with exactly
                     // the placeholders its author wrote.
                     let mut rewrite_params = connectors.noria.rewrite_params();
+                    // A scoped exclusion cannot be honored: a read has no way to name the scope
+                    // its literals came from, so it could never reach such a cache.
+                    if autoparam.has_exclusions() {
+                        return Err(ReadySetError::Unsupported(
+                            "AUTOPARAM exclusion scopes".into(),
+                        ));
+                    }
                     rewrite_params.autoparameterize = autoparam.autoparameterize();
+                    // A cache keeping its literals inline is reached by the shape a read hashes
+                    // to, which the rewrite's structural passes produce. Those passes run only
+                    // for a statement holding no placeholder, so a statement holding one takes a
+                    // shape no read arrives at and the cache would serve nothing.
+                    if !rewrite_params.autoparameterize
+                        && let Ok(stmt) = &deep
+                        && !readyset_sql_passes::adapter_rewrites::inline_literals_are_reachable(
+                            stmt,
+                            rewrite_params.dialect,
+                        )?
+                    {
+                        return Err(ReadySetError::Unsupported(
+                            "AUTOPARAM with a placeholder in a joined or nested statement".into(),
+                        ));
+                    }
                     match deep {
                         Ok(mut deep) => match adapter_rewrites::rewrite_query(
                             &mut deep,
@@ -531,39 +553,49 @@ where
 
                 Ok((deep, shallow, schema_generation))
             }
-            CacheInner::Id(id) => match state
-                .query_status_cache
-                .query_with_schema_generation(id.as_str())
-            {
-                Some((q, schema_gen)) => match q {
-                    Query::Parsed(deep) => {
-                        // Deep queries must have a stored generation from rewrite time;
-                        // missing generation here is a programming error since all deep
-                        // queries go through query_migration_state during prepare.
-                        let Some(generation) = schema_gen else {
-                            internal!("deep query {id} in QSC without schema_generation")
-                        };
-                        Ok((
-                            Ok((*deep).clone()),
-                            Err(ReadySetError::NoQueryForId { id: id.to_string() }),
-                            generation,
-                        ))
-                    }
-                    Query::ShallowParsed(shallow) => {
-                        // Shallow queries are schema-insensitive; generation is unused
-                        // by the shallow path but we need to return something. Use
-                        // INITIAL since the shallow create_cache path ignores it.
-                        let generation = schema_gen.unwrap_or(SchemaGeneration::INITIAL);
-                        Ok((
-                            Err(ReadySetError::NoQueryForId { id: id.to_string() }),
-                            Ok((*shallow).clone()),
-                            generation,
-                        ))
-                    }
-                    Query::ParseFailed(_, e) => Err(ReadySetError::UnparseableQuery(e)),
-                },
-                None => Err(ReadySetError::NoQueryForId { id: id.to_string() }),
-            },
+            CacheInner::Id(id) => {
+                // A query reaches the status cache already rewritten, so by the time it has an id
+                // the literals to keep are gone. `ON` is what that form already is; anything
+                // asking for less is refused rather than built as a cache that ignores it.
+                if !autoparam.autoparameterize() || autoparam.has_exclusions() {
+                    return Err(ReadySetError::Unsupported(
+                        "AUTOPARAM with a query id: give the statement instead".into(),
+                    ));
+                }
+                match state
+                    .query_status_cache
+                    .query_with_schema_generation(id.as_str())
+                {
+                    Some((q, schema_gen)) => match q {
+                        Query::Parsed(deep) => {
+                            // Deep queries must have a stored generation from rewrite time;
+                            // missing generation here is a programming error since all deep
+                            // queries go through query_migration_state during prepare.
+                            let Some(generation) = schema_gen else {
+                                internal!("deep query {id} in QSC without schema_generation")
+                            };
+                            Ok((
+                                Ok((*deep).clone()),
+                                Err(ReadySetError::NoQueryForId { id: id.to_string() }),
+                                generation,
+                            ))
+                        }
+                        Query::ShallowParsed(shallow) => {
+                            // Shallow queries are schema-insensitive; generation is unused
+                            // by the shallow path but we need to return something. Use
+                            // INITIAL since the shallow create_cache path ignores it.
+                            let generation = schema_gen.unwrap_or(SchemaGeneration::INITIAL);
+                            Ok((
+                                Err(ReadySetError::NoQueryForId { id: id.to_string() }),
+                                Ok((*shallow).clone()),
+                                generation,
+                            ))
+                        }
+                        Query::ParseFailed(_, e) => Err(ReadySetError::UnparseableQuery(e)),
+                    },
+                    None => Err(ReadySetError::NoQueryForId { id: id.to_string() }),
+                }
+            }
         }
     }
 
@@ -1534,6 +1566,20 @@ where
                     topk_buffer_multiplier,
                     autoparam,
                 } = create_cache_stmt;
+
+                let cache_mode = settings.cache_mode;
+                let deep_requested = *cache_type == Some(CacheType::Deep);
+                let shallow_requested = *cache_type == Some(CacheType::Shallow);
+
+                // AUTOPARAM decides the form a deep cache takes, and a shallow cache holds its
+                // query with the literals its author wrote, so there is nothing for the clause to
+                // apply to. Refuse it the way a shallow-only option is refused on a deep cache.
+                if !autoparam.is_default()
+                    && (shallow_requested || (cache_mode.is_shallow() && !deep_requested))
+                {
+                    unsupported!("AUTOPARAM is not supported for SHALLOW caches");
+                }
+
                 let (deep, shallow, schema_generation) =
                     Self::query_from_cache_inner(connectors, settings, state, inner, *autoparam)
                         .await?;
@@ -1560,10 +1606,6 @@ where
                 } else {
                     None
                 };
-
-                let cache_mode = settings.cache_mode;
-                let deep_requested = *cache_type == Some(CacheType::Deep);
-                let shallow_requested = *cache_type == Some(CacheType::Shallow);
 
                 if deep_requested || (cache_mode.is_deep() && !shallow_requested) {
                     Self::create_deep_cache(
