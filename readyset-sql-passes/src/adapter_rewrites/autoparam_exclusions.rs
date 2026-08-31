@@ -2,6 +2,13 @@
 //! marks literals in the excluded clause origins so autoparameterization keeps them inline, and
 //! the lockstep diff that derives the frozen positions from the rewritten forms.
 //!
+//! # Disabled
+//!
+//! Nothing in the product calls this. A cache built from marked literals takes a form no read
+//! produces on its own, so reaching it needs every read rewritten into that form, and the
+//! reconciliation below only ever managed it for the forms it could verify were aligned. The
+//! pass and its tests stay as the starting point for reaching such a cache deliberately.
+//!
 //! The marking must happen before the rewrite pipeline runs because the unnest/hoist passes
 //! relocate predicates from `EXISTS`, `JOIN ON`, and subqueries into the top-level WHERE, erasing
 //! their origin by the time autoparameterization sees them. The marker ([`Literal::Preserved`])
@@ -24,7 +31,7 @@ use readyset_sql::ast::{
 ///
 /// Only literals in positions autoparameterization could touch are wrapped: `col = lit` and
 /// `col <ordering op> lit`, in either operand order. Placeholders and IN lists are never
-/// wrapped (frozen IN-list literals are unsupported in v1).
+/// wrapped (an `IN` list's literals are never wrapped).
 pub fn wrap_autoparam_exclusions(stmt: &mut SelectStatement, control: &AutoparamControl) {
     if control.off
         || (!control.exclude_joins && !control.exclude_exists && !control.exclude_subqueries)

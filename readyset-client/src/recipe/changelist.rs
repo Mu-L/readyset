@@ -577,11 +577,10 @@ impl Change {
                     }
                 };
 
+                // The statement's own option decides the recipe's form, so it matches the one
+                // the adapter built from the same statement.
                 let mut adapter_rewrite_params = adapter_rewrite_params;
                 adapter_rewrite_params.autoparameterize = !autoparam.off;
-                // EXCLUDE_* scopes mark their literals before the rewrite pipeline hoists them
-                // out of their clause of origin, so the recipe's form matches the adapter's.
-                adapter_rewrites::wrap_autoparam_exclusions(&mut statement, &autoparam);
                 adapter_rewrites::rewrite_query(
                     &mut statement,
                     adapter_rewrite_params,

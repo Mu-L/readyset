@@ -540,19 +540,13 @@ where
                 let deep = if settings.cache_mode.is_shallow() {
                     Err(ReadySetError::Unsupported("shallow-only mode".into()))
                 } else {
-                    // AUTOPARAM OFF turns off the autoparameterization pass for this cache so
-                    // it's built with exactly the placeholders the user wrote.
+                    // The option decides the form the cache takes: `OFF` builds it with exactly
+                    // the placeholders its author wrote.
                     let mut rewrite_params = connectors.noria.rewrite_params();
                     rewrite_params.autoparameterize = !autoparam.off;
                     match deep {
                         Ok(mut deep) => {
-                            // Incoming SELECTs hash to the standard (fully autoparameterized)
-                            // form, so keep a pre-rewrite copy to compute that form alongside
-                            // the manual one.
                             let standard_src = (!autoparam.is_default()).then(|| (*deep).clone());
-                            // EXCLUDE_* scopes mark their literals before the rewrite pipeline
-                            // hoists them out of their clause of origin.
-                            adapter_rewrites::wrap_autoparam_exclusions(&mut deep, &autoparam);
                             match adapter_rewrites::rewrite_query(
                                 &mut deep,
                                 rewrite_params,
