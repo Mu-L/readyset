@@ -9,6 +9,11 @@ use crate::rewrite_utils::{
     iter_and_conjuncts, predicate_caps_row_number, preserve_row_number_caps,
 };
 
+/// The key a read looks its cache up by: what it carries at each position the cache
+/// parameterized, against the cache parameter that position fills.
+/// See [`LiteralSlots::match_read`].
+pub type CacheLookupKey = Vec<(usize, Literal)>;
+
 /// Collect top-level WHERE conjuncts that cap a `ROW_NUMBER()` projection, returning a set
 /// keyed by value-equality on `Expr`. Both orientations of each cap predicate are inserted
 /// so the gate at the top of `visit_expr` also short-circuits the literal-on-left shape
@@ -56,16 +61,118 @@ fn flip_binary_operands(expr: &Expr) -> Option<Expr> {
     })
 }
 
+/// What the autoparameterization pass found at each canonical parameter position: the literal it
+/// lifted there, or `None` where the query already held a placeholder.
+///
+/// A canonical parameter position is one [`auto_parameterize_query`] takes: a literal it lifts, or
+/// a placeholder already there. They are numbered from zero in walk order, and the numbering runs
+/// across both rewrite phases, since the second walks the query again.
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LiteralSlots {
+    /// The literal at each canonical position, or `None` where the query already held a
+    /// placeholder.
+    slots: Box<[Option<Literal>]>,
+    /// Where each `IN` list's positions start and how many it took, in walk order.
+    /// `collapse_where_in` folds every list into a single predicate, so two queries whose lists
+    /// hold the same literals reach the same shape; the runs are what tell them apart. The start
+    /// matters as much as the length, since a run of the same length sitting at a different
+    /// position is a different query.
+    in_list_runs: Box<[(usize, usize)]>,
+}
+
+impl LiteralSlots {
+    /// How many canonical positions the query has.
+    pub fn positions(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// How many positions hold a literal. A cache holding more of them answers fewer reads, so
+    /// this is how specific it is.
+    pub fn inline_positions(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// Match a read against these slots, which are a cache's.
+    ///
+    /// A position where the cache holds a literal is one it kept inline, so the read has to carry
+    /// the same literal there. A position holding `None` is one the cache parameterized, which any
+    /// value satisfies -- including a placeholder whose value arrives with the client's parameters.
+    ///
+    /// `Some` carries the read's lookup key: what it holds at the positions the cache
+    /// parameterized, each against the cache parameter it fills.
+    ///
+    /// `None` when the read belongs to another cache: a literal that differs, a different number
+    /// of positions, or a placeholder where this cache baked a literal in.
+    pub fn match_read(&self, read: &Self) -> Option<CacheLookupKey> {
+        // Grouping first: the shape a read hashes to says nothing about how its positions
+        // partition across `IN` lists, so two queries holding the same literals in different
+        // groupings reach this point looking alike.
+        if self.in_list_runs != read.in_list_runs || self.slots.len() != read.slots.len() {
+            return None;
+        }
+        let mut lookup = Vec::new();
+        // Which of the cache's own parameters the next parameterized position is.
+        let mut parameter = 0;
+        for (cached, found) in self.slots.iter().zip(read.slots.iter()) {
+            match (cached, found) {
+                // Kept inline: the read spells out the same literal, which says which cache over
+                // this shape it belongs to rather than keying a lookup into it.
+                (Some(cached), Some(found)) if cached == found => {}
+                (Some(_), _) => return None,
+                // Parameterized: whatever the read carries here keys the lookup. A placeholder
+                // carries nothing, since its value arrives with the client's parameters, so it
+                // leaves this parameter for them to fill.
+                (None, found) => {
+                    if let Some(found) = found {
+                        lookup.push((parameter, found.clone()));
+                    }
+                    parameter += 1;
+                }
+            }
+        }
+        Some(lookup)
+    }
+}
+
+/// Slots with no `IN` grouping recorded, which only a test can mean: a query's grouping comes
+/// from the walk, and claiming none of it would let two different groupings match.
+#[cfg(test)]
+impl From<Vec<Option<Literal>>> for LiteralSlots {
+    fn from(slots: Vec<Option<Literal>>) -> Self {
+        Self {
+            slots: slots.into_boxed_slice(),
+            in_list_runs: Box::new([]),
+        }
+    }
+}
+
+/// What one run of [`auto_parameterize_query`] produced.
+#[derive(Debug, Default)]
+pub struct AutoParameters {
+    /// `(position in the emitted form, literal)` for every literal the run lifted, following
+    /// whatever parameters the caller passed in.
+    pub params: Vec<(usize, Literal)>,
+    /// What the walk found at each canonical position, carrying whatever an earlier phase found
+    /// at the positions it passed again.
+    pub slots: LiteralSlots,
+}
+
 #[derive(Default)]
 struct AutoParameterizeVisitor {
     autoparameterize_equals: bool,
     autoparameterize_ranges: bool,
     out: Vec<(usize, Literal)>,
     in_supported_position: bool,
-    /// How many placeholders the walk has passed, which is the index the next parameter takes.
-    /// Placeholders already in the query -- whether the caller wrote them or an earlier phase
-    /// produced them -- are counted as the walk reaches them, so it starts from zero.
-    param_index: usize,
+    /// What the walk found at each canonical position it has passed. Its length is both the
+    /// number of positions taken and the index the next parameter takes, since every position
+    /// the walk takes becomes a parameter.
+    slots: Vec<Option<Literal>>,
+    /// What an earlier phase found at the positions this walk passes again. A placeholder this
+    /// walk reaches may be one that phase lifted from a literal, which the query alone no longer
+    /// says.
+    prev_slots: Vec<Option<Literal>>,
+    /// Where each `IN` list's positions start and how many it took, in walk order.
+    in_list_runs: Vec<(usize, usize)>,
     query_depth: u8,
     visit_limit_clause: bool,
     /// Top-level WHERE conjuncts (in both orientations) that cap a `ROW_NUMBER()`
@@ -83,20 +190,6 @@ fn unwrap_preserved(literal: &mut Literal) {
         && let Literal::Preserved(inner) = mem::replace(literal, Literal::Null)
     {
         *literal = *inner;
-    }
-}
-
-impl AutoParameterizeVisitor {
-    fn replace_literal(&mut self, literal: &mut Literal) {
-        // A literal frozen by the exclusion pre-pass must not be parameterized. The marker stays
-        // in place so the second autoparameterization phase preserves it too; the final sweep at
-        // the end of the Readyset rewrite unwraps it.
-        if matches!(literal, Literal::Preserved(_)) {
-            return;
-        }
-        let literal = mem::replace(literal, Literal::Placeholder(ItemPlaceholder::QuestionMark));
-        self.out.push((self.param_index, literal));
-        self.param_index += 1;
     }
 }
 
@@ -118,36 +211,34 @@ pub(super) fn unwrap_all_preserved(query: &mut SelectStatement) {
     let Ok(()) = UnwrapPreservedVisitor.visit_select_statement(query);
 }
 
-impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
-    type Error = ReadySetError;
+impl AutoParameterizeVisitor {
+    /// Account for a placeholder already in the query: it holds a canonical position, and a
+    /// position in the form the pass emits. Call this exactly once per canonical position.
+    ///
+    /// Indexing `prev_slots` by the count so far holds because every position the second phase
+    /// adds trails the ones the first phase took. The only positions it adds are the top-level
+    /// limit clause's: the first phase does not walk a limit clause, the walk reaches that clause
+    /// after the rest of the query, and `visit_limit_clause` keeps a subquery's out of the walk.
+    fn count_placeholder(&mut self) {
+        let lifted_earlier = self.prev_slots.get(self.slots.len()).cloned().flatten();
+        self.slots.push(lifted_earlier);
+    }
 
-    fn visit_literal(&mut self, literal: &'ast mut Literal) -> Result<(), Self::Error> {
-        if matches!(literal, Literal::Placeholder(_)) {
-            self.param_index += 1;
+    fn replace_literal(&mut self, literal: &mut Literal) {
+        // A literal marked by the exclusion pre-pass must not be parameterized. The marker stays
+        // in place so the second autoparameterization phase preserves it too; the final sweep at
+        // the end of the Readyset rewrite unwraps it. It holds no canonical position, which is
+        // why a slot cannot express a scope's marks -- see `autoparam_exclusions`.
+        if matches!(literal, Literal::Preserved(_)) {
+            return;
         }
-        Ok(())
+        let literal = mem::replace(literal, Literal::Placeholder(ItemPlaceholder::QuestionMark));
+        self.out.push((self.slots.len(), literal.clone()));
+        self.slots.push(Some(literal));
     }
 
-    fn visit_select_statement(
-        &mut self,
-        select_statement: &'ast mut SelectStatement,
-    ) -> Result<(), Self::Error> {
-        self.query_depth = self.query_depth.saturating_add(1);
-        visit_mut::walk_select_statement(self, select_statement)?;
-        self.query_depth = self.query_depth.saturating_sub(1);
-        Ok(())
-    }
-
-    fn visit_where_clause(&mut self, expression: &'ast mut Expr) -> Result<(), Self::Error> {
-        // We can only support parameters in the WHERE clause of the top-level query, not any
-        // subqueries it contains.
-        self.in_supported_position = self.query_depth <= 1;
-        self.visit_expr(expression)?;
-        self.in_supported_position = false;
-        Ok(())
-    }
-
-    fn visit_expr(&mut self, expression: &'ast mut Expr) -> Result<(), Self::Error> {
+    /// The walk proper. `visit_expr` wraps this to measure the positions an `IN` list takes.
+    fn visit_expr_taking_positions(&mut self, expression: &mut Expr) -> ReadySetResult<()> {
         let was_supported = self.in_supported_position;
         // Preserve row-number cap literals: the integer bound is a cardinality signal
         // that CBJR reads from the AST. Skipping the walk here keeps the literal
@@ -165,7 +256,7 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
                                 match lit {
                                     // A placeholder holds a parameter position of its own, so
                                     // the positions after it are numbered past it.
-                                    Literal::Placeholder(_) => self.param_index += 1,
+                                    Literal::Placeholder(_) => self.count_placeholder(),
                                     _ if self.autoparameterize_equals => self.replace_literal(lit),
                                     _ => {}
                                 }
@@ -285,14 +376,66 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
         self.in_supported_position = was_supported;
         Ok(())
     }
+}
+
+impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
+    type Error = ReadySetError;
+
+    fn visit_literal(&mut self, literal: &'ast mut Literal) -> Result<(), Self::Error> {
+        if matches!(literal, Literal::Placeholder(_)) {
+            self.count_placeholder();
+        }
+        Ok(())
+    }
+
+    fn visit_select_statement(
+        &mut self,
+        select_statement: &'ast mut SelectStatement,
+    ) -> Result<(), Self::Error> {
+        self.query_depth = self.query_depth.saturating_add(1);
+        visit_mut::walk_select_statement(self, select_statement)?;
+        self.query_depth = self.query_depth.saturating_sub(1);
+        Ok(())
+    }
+
+    fn visit_where_clause(&mut self, expression: &'ast mut Expr) -> Result<(), Self::Error> {
+        // We can only support parameters in the WHERE clause of the top-level query, not any
+        // subqueries it contains.
+        self.in_supported_position = self.query_depth <= 1;
+        self.visit_expr(expression)?;
+        self.in_supported_position = false;
+        Ok(())
+    }
+
+    fn visit_expr(&mut self, expression: &'ast mut Expr) -> Result<(), Self::Error> {
+        // An `IN` list takes a contiguous run of canonical positions, and `collapse_where_in`
+        // folds the whole list into one predicate later, so the run's length is the only record
+        // that the grouping was there. Take it here rather than where literals are lifted, since
+        // a list the author wrote as placeholders is grouped the same way and lifts nothing.
+        if matches!(
+            expression,
+            Expr::In {
+                rhs: InValue::List(_),
+                ..
+            }
+        ) {
+            let before = self.slots.len();
+            let walked = self.visit_expr_taking_positions(expression);
+            if self.slots.len() > before {
+                self.in_list_runs.push((before, self.slots.len() - before));
+            }
+            return walked;
+        }
+        self.visit_expr_taking_positions(expression)
+    }
 
     fn visit_offset(&mut self, offset: &'ast mut Literal) -> Result<(), Self::Error> {
         if !matches!(offset, Literal::Placeholder(_))
             && self.autoparameterize_equals
             && self.query_depth <= 1
         {
-            // `replace_literal` has accounted for this literal, so the walk stops here rather
-            // than reaching the placeholder it just wrote and counting it a second time.
+            // `replace_literal` has accounted for the position, so the walk stops here rather
+            // than reaching it again.
             self.replace_literal(offset);
             return Ok(());
         }
@@ -304,7 +447,7 @@ impl<'ast> VisitorMut<'ast> for AutoParameterizeVisitor {
         &mut self,
         limit_clause: &'ast mut readyset_sql::ast::LimitClause,
     ) -> Result<(), Self::Error> {
-        if self.visit_limit_clause {
+        if self.visit_limit_clause && self.query_depth <= 1 {
             visit_mut::walk_limit_clause(self, limit_clause)
         } else {
             Ok(())
@@ -362,8 +505,9 @@ impl<'ast> VisitorMut<'ast> for AnalyzeLiteralsVisitor {
         if was_supported {
             match expression {
                 Expr::BinaryOp { lhs, op, rhs } => match (lhs.as_mut(), op, rhs.as_mut()) {
-                    // Literals frozen by the exclusion pre-pass won't be parameterized, so they
-                    // must not influence the equals/range mixing gate: fall through as unsupported.
+                    // A literal marked by the exclusion pre-pass won't be parameterized, so it
+                    // must not influence the equals/range mixing gate: fall through as
+                    // unsupported.
                     (Expr::Column(_), BinaryOperator::Equal, Expr::Literal(lit))
                         if !matches!(lit, Literal::Preserved(_)) =>
                     {
@@ -472,12 +616,17 @@ impl<'ast> VisitorMut<'ast> for AnalyzeLiteralsVisitor {
 
 /// Replace all literals in positions we support with placeholders, extracting the literals as
 /// parameters in a parameter list of (placeholder position, value).
+///
+/// `prev` and `prev_slots` come from an earlier phase's run over the same query, so this walk
+/// numbers its positions in one space with that one and reports what was originally at each.
 pub fn auto_parameterize_query(
     query: &mut SelectStatement,
     prev: Vec<(usize, Literal)>,
+    prev_slots: LiteralSlots,
+    autoparameterize: bool,
     server_supports_mixed_comparisons: bool,
     visit_limit_clause: bool,
-) -> ReadySetResult<Vec<(usize, Literal)>> {
+) -> ReadySetResult<AutoParameters> {
     let cap_predicates = collect_top_level_caps(query);
 
     // Don't try to auto-parameterize equal-queries that already contain range params for now, since
@@ -488,7 +637,11 @@ pub fn auto_parameterize_query(
     };
     visitor.visit_select_statement(query).unwrap();
 
-    let (autoparameterize_equals, autoparameterize_ranges) = if server_supports_mixed_comparisons {
+    let (autoparameterize_equals, autoparameterize_ranges) = if !autoparameterize {
+        // Every literal the author wrote stays inline, which is the form a cache created with
+        // `AUTOPARAM OFF` takes. The walk still runs, so it counts the placeholders already there.
+        (false, false)
+    } else if server_supports_mixed_comparisons {
         (true, true)
     } else if !visitor.contains_range {
         // If a query contains no range comparisons in positions that support
@@ -518,8 +671,8 @@ pub fn auto_parameterize_query(
             // comparisons only, since we don't support mixed comparisons yet
             (false, false) => (true, false),
             // A query that already mixes equal and range placeholders gets neither, since we
-            // don't support mixed comparisons yet. The walk still runs, so the parameters the
-            // caller passed in survive it.
+            // don't support mixed comparisons yet. The walk still runs, so it counts the
+            // placeholders already there and reports the query's canonical positions.
             (true, true) => (false, false),
         }
     };
@@ -528,12 +681,19 @@ pub fn auto_parameterize_query(
         autoparameterize_equals,
         autoparameterize_ranges,
         out: prev,
+        prev_slots: prev_slots.slots.into_vec(),
         visit_limit_clause,
         cap_predicates,
         ..Default::default()
     };
     visitor.visit_select_statement(query)?;
-    Ok(visitor.out)
+    Ok(AutoParameters {
+        params: visitor.out,
+        slots: LiteralSlots {
+            slots: visitor.slots.into_boxed_slice(),
+            in_list_runs: visitor.in_list_runs.into_boxed_slice(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -550,6 +710,50 @@ mod tests {
         try_parse_select_statement(q, dialect).unwrap()
     }
 
+    #[test]
+    fn a_subquery_limit_placeholder_takes_no_position() {
+        let dialect = readyset_sql::Dialect::MySQL;
+        let both_phases = |sql: &str| {
+            let mut first_query = parse_select_statement(sql, dialect);
+            let first = auto_parameterize_query(
+                &mut first_query,
+                Vec::new(),
+                LiteralSlots::default(),
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            let mut second_query = parse_select_statement(sql, dialect);
+            let second = auto_parameterize_query(
+                &mut second_query,
+                first.params.clone(),
+                first.slots.clone(),
+                true,
+                false,
+                true,
+            )
+            .unwrap();
+            (first.slots, second.slots)
+        };
+
+        for sql in [
+            "SELECT * FROM (SELECT x FROM t WHERE a = 1 LIMIT ?) sub WHERE sub.x = 2",
+            "WITH c AS (SELECT x FROM t WHERE a = 1 LIMIT ?) SELECT * FROM c WHERE c.x = 2",
+        ] {
+            let (first, second) = both_phases(sql);
+            assert_eq!(
+                first.slots, second.slots,
+                "a subquery's limit placeholder took a position for {sql}"
+            );
+        }
+
+        // The top-level clause is walked, so its placeholder takes the position after the literal
+        // the first phase lifted.
+        let (_, second) = both_phases("SELECT x FROM t WHERE a = 1 LIMIT ?");
+        assert_eq!(second.slots.to_vec(), vec![Some(Literal::Integer(1)), None]);
+    }
+
     fn test_auto_parameterize(
         query: &str,
         expected_query: &str,
@@ -564,10 +768,13 @@ mod tests {
         let res = auto_parameterize_query(
             &mut query,
             Vec::new(),
+            LiteralSlots::default(),
+            true,
             server_supports_mixed_comparisons,
             true,
         )
-        .unwrap();
+        .unwrap()
+        .params;
         assert_eq!(
             query,
             expected,
@@ -658,7 +865,16 @@ mod tests {
         );
         FreezeStrings.visit_select_statement(&mut query).unwrap();
 
-        let params = auto_parameterize_query(&mut query, Vec::new(), false, true).unwrap();
+        let params = auto_parameterize_query(
+            &mut query,
+            Vec::new(),
+            LiteralSlots::default(),
+            true,
+            false,
+            true,
+        )
+        .unwrap()
+        .params;
         unwrap_all_preserved(&mut query);
 
         // `name` stays an inline constant; `id` is autoparameterized. Equality also proves no
@@ -701,7 +917,16 @@ mod tests {
             .visit_select_statement(&mut query)
             .unwrap();
 
-        let params = auto_parameterize_query(&mut query, Vec::new(), false, true).unwrap();
+        let params = auto_parameterize_query(
+            &mut query,
+            Vec::new(),
+            LiteralSlots::default(),
+            true,
+            false,
+            true,
+        )
+        .unwrap()
+        .params;
         unwrap_all_preserved(&mut query);
 
         let expected =
@@ -1181,7 +1406,16 @@ mod tests {
         ) {
             let mut query = parse_mysql(query);
             let expected = parse_mysql(expected_query);
-            let res = auto_parameterize_query(&mut query, Vec::new(), false, true).unwrap();
+            let res = auto_parameterize_query(
+                &mut query,
+                Vec::new(),
+                LiteralSlots::default(),
+                true,
+                false,
+                true,
+            )
+            .unwrap()
+            .params;
             assert_eq!(
                 query,
                 expected,
@@ -1294,11 +1528,25 @@ mod tests {
                 "SELECT * FROM posts WHERE id = 1 LIMIT 3 OFFSET 6",
                 Dialect::MySQL,
             );
-            let phase_one = auto_parameterize_query(&mut query, Vec::new(), false, false).unwrap();
-            assert_eq!(phase_one, vec![(0, 1.into())]);
+            let one = auto_parameterize_query(
+                &mut query,
+                Vec::new(),
+                LiteralSlots::default(),
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(one.params, vec![(0, 1.into())]);
+            assert_eq!(one.slots, vec![Some(1.into())].into());
 
-            let phase_two = auto_parameterize_query(&mut query, phase_one, false, true).unwrap();
-            assert_eq!(phase_two, vec![(0, 1.into()), (1, 6.into())]);
+            // The second walk sees the first's lifted literal as a placeholder, and its slots say
+            // it was a literal all the same. The OFFSET it reaches is a position the first never
+            // took.
+            let two = auto_parameterize_query(&mut query, one.params, one.slots, true, false, true)
+                .unwrap();
+            assert_eq!(two.params, vec![(0, 1.into()), (1, 6.into())]);
+            assert_eq!(two.slots, vec![Some(1.into()), Some(6.into())].into());
         }
 
         /// A placeholder inside a row comparison occupies a parameter position, so the literal

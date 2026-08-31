@@ -9,7 +9,15 @@ fn auto_parameterize_query(c: &mut Criterion) {
         b.iter_batched(
             || q.clone(),
             |mut q| {
-                adapter_rewrites::auto_parameterize_query(&mut q, Vec::new(), false, true).unwrap();
+                adapter_rewrites::auto_parameterize_query(
+                    &mut q,
+                    Vec::new(),
+                    adapter_rewrites::LiteralSlots::default(),
+                    true,
+                    false,
+                    true,
+                )
+                .unwrap();
                 black_box(q)
             },
             BatchSize::SmallInput,

@@ -3,9 +3,15 @@
 //!
 //! # Disabled
 //!
-//! Nothing in the product calls this. A cache built from marked literals takes a form no read
-//! produces on its own, so reaching it needs every read rewritten into that form. The pass and
-//! its tests stay as the starting point for doing that deliberately.
+//! Nothing in the product calls this today. A cache built from marked literals takes a form no
+//! read produces on its own, so reaching it needs the read matched against that form -- which is
+//! what [`LiteralSlots`] does, and a scope's marks are not expressible as slots: a marked literal
+//! is skipped rather than counted, so it holds no canonical position for a slot to name. Wiring
+//! the two together means giving marked literals positions of their own, which is a change to how
+//! every query is numbered. Until then `CREATE CACHE` rejects the option. The pass and its tests
+//! stay so that work has a starting point.
+//!
+//! [`LiteralSlots`]: super::autoparameterize::LiteralSlots
 //!
 //! The marking must happen before the rewrite pipeline runs because the unnest/hoist passes
 //! relocate predicates from `EXISTS`, `JOIN ON`, and subqueries into the top-level WHERE, erasing

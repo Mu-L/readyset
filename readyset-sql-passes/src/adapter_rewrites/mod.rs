@@ -8,16 +8,17 @@ use std::fmt::Debug;
 use std::{iter, mem};
 
 pub use autoparam_exclusions::wrap_autoparam_exclusions;
-pub use autoparameterize::auto_parameterize_query;
+pub use autoparameterize::{AutoParameters, CacheLookupKey, LiteralSlots, auto_parameterize_query};
 use itertools::{Either, Itertools, repeat_n};
 use readyset_data::{Collation, DfType, DfValue};
 use readyset_errors::{
     ReadySetError, ReadySetResult, internal_err, invalid_query_err, unsupported,
 };
+use readyset_sql::analysis::visit::{self, Visitor};
 use readyset_sql::analysis::visit_mut::{self, VisitorMut};
 use readyset_sql::ast::{
     BinaryOperator, Expr, InValue, ItemPlaceholder, LimitClause, Literal, SelectMetadata,
-    SelectStatement, ShallowCacheQuery,
+    SelectStatement, ShallowCacheQuery, TableExprInner,
 };
 use readyset_sql::{Dialect, DialectDisplay, TryFromDialect, TryIntoDialect};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ use crate::inline_leading_derived_table::InlineLeadingDerivedTable as _;
 use crate::normalize_right_join::NormalizeRightJoin as _;
 use crate::normalize_subquery_positions::NormalizeSubqueryPositions as _;
 use crate::query_optimization_rewrite::{OptimizationStrategy, QueryOptimizationRewrite};
-use crate::rewrite_utils::contains_question_mark_placeholders;
+use crate::rewrite_utils::{contains_placeholders, contains_question_mark_placeholders};
 use crate::shallow::literalize_shallow_prepared;
 use crate::unnest_subqueries::{NonNullSchemaImpl, UnnestSubqueries as _};
 use crate::validate_pipeline_invariants::ValidatePipelineInvariants as _;
@@ -70,6 +71,9 @@ pub struct DfQueryParameters {
     auto_parameters: Vec<(usize, Literal)>,
     pagination_parameters: AdapterPaginationParams,
     post_lookup_plan: PostLookupPlan,
+    /// What the rewrite found at each canonical parameter position, which is what a cache's
+    /// inline literals are matched against.
+    slots: LiteralSlots,
 }
 
 /// Information about parameters from a query, which allows converting a parameter list into a
@@ -79,6 +83,9 @@ pub struct QueryParameters {
     dialect: Dialect,
     reordered_placeholders: Option<Vec<usize>>,
     auto_parameters: Vec<(usize, Literal)>,
+    /// What this rewrite found at each canonical position, carried so the Readyset rewrite still
+    /// knows which of the placeholders it walks were literals this one lifted.
+    slots: LiteralSlots,
 }
 
 /// Tracks an IN/NOT IN clause that becomes a single array parameter for shallow caching.
@@ -165,9 +172,12 @@ pub struct AdapterRewriteParams {
     /// flag is true, both equals and range parameters in supported positions will be
     /// autoparameterized during the adapter rewrite passes.
     pub server_supports_mixed_comparisons: bool,
-    /// Whether to run the autoparameterization pass. Defaults to `true`.
-    /// `CREATE CACHE WITH (AUTOPARAM OFF)` sets this to `false` so the cache is built with exactly
-    /// the placeholders the user wrote; explicit `?`/`$N` placeholders are still numbered.
+    /// Whether every literal in a position that supports it becomes a parameter, so that one
+    /// cache serves every value of it.
+    ///
+    /// When false, a cache instead keeps the literals its author wrote inline, and answers only
+    /// the reads that carry those same literals; any other read goes upstream. Defaults to
+    /// `true`.
     pub autoparameterize: bool,
 }
 
@@ -204,7 +214,7 @@ impl<C: AdapterRewriteContext> AdapterRewriteContext for &C {}
 /// - Replaces literals with placeholders when they can be used as lookup indices in the noria
 ///   dataflow representation of the query. Note that this pass may not replace all literals and is
 ///   therefore cannot guarantee that the rewritten query is free of user PII.
-pub fn rewrite_equivalent_parameters(
+fn rewrite_equivalent_parameters(
     query: &mut SelectStatement,
     flags: AdapterRewriteParams,
 ) -> ReadySetResult<QueryParameters> {
@@ -219,26 +229,21 @@ pub fn rewrite_equivalent_parameters(
         placeholders=?reordered_placeholders
     );
 
-    let auto_parameters = if !flags.autoparameterize {
-        // Autoparameterization explicitly disabled (CREATE CACHE WITH (AUTOPARAM OFF)).
-        // Leave any user-written placeholders in place; they're numbered below.
-        trace!(parent: &span, pass = "auto_parameterize_query", skipped = true);
-        Vec::new()
-    } else {
-        let auto_parameters = autoparameterize::auto_parameterize_query(
-            query,
-            Vec::new(),
-            flags.server_supports_mixed_comparisons,
-            false,
-        )?;
-        trace!(
-            parent: &span,
-            pass="auto_parameterize_query",
-            query = %query.display(flags.dialect),
-            auto_parameters=?auto_parameters
-        );
-        auto_parameters
-    };
+    let run = autoparameterize::auto_parameterize_query(
+        query,
+        Vec::new(),
+        LiteralSlots::default(),
+        flags.autoparameterize,
+        flags.server_supports_mixed_comparisons,
+        false,
+    )?;
+    trace!(
+        parent: &span,
+        pass="auto_parameterize_query",
+        query = %query.display(flags.dialect),
+        auto_parameters=?run.params,
+        canonical_positions=run.slots.positions(),
+    );
 
     number_placeholders(query)?;
     trace!(parent: &span, pass="number_placeholders", query = %query.display(flags.dialect));
@@ -246,8 +251,61 @@ pub fn rewrite_equivalent_parameters(
     Ok(QueryParameters {
         dialect: flags.dialect,
         reordered_placeholders,
-        auto_parameters,
+        auto_parameters: run.params,
+        slots: run.slots,
     })
+}
+
+/// Whether a read can reach a cache that keeps this statement's literals inline.
+///
+/// The shape a read hashes to comes out of the structural passes in
+/// [`rewrite_equivalent_deep`], which run only for a statement holding no placeholder. A
+/// statement that holds one takes a shape those passes never produce, so a read spelling its own
+/// values out looks under a different shape and finds nothing there. The two coincide only where
+/// the passes have nothing to reshape.
+///
+/// What counts is whether the cache and a read of it land on the same side of that gate, and a
+/// read's placeholders are spelled the way its client spells them. A MySQL client binds `?`, so a
+/// cache written with `$n` keeps the passes while the read that should reach it does not; both
+/// spellings are equally out of reach there. A Postgres client binds `$n`, which keeps the passes
+/// on both sides, so only a `?` puts them on opposite sides.
+pub fn inline_literals_are_reachable(
+    query: &SelectStatement,
+    dialect: Dialect,
+) -> ReadySetResult<bool> {
+    let gated = match dialect {
+        Dialect::MySQL => contains_placeholders(query)?,
+        Dialect::PostgreSQL => contains_question_mark_placeholders(query)?,
+    };
+    if !gated {
+        return Ok(true);
+    }
+    Ok(query.ctes.is_empty()
+        && query.join.is_empty()
+        && query.tables.len() == 1
+        && !matches!(
+            query.tables.first().map(|t| &t.inner),
+            Some(TableExprInner::Subquery(_))
+        )
+        && !contains_subquery_expr(query))
+}
+
+/// Whether any expression in the statement holds a subquery.
+fn contains_subquery_expr(query: &SelectStatement) -> bool {
+    struct FindSubquery {
+        found: bool,
+    }
+    impl<'ast> Visitor<'ast> for FindSubquery {
+        type Error = std::convert::Infallible;
+
+        fn visit_select_statement(&mut self, _: &'ast SelectStatement) -> Result<(), Self::Error> {
+            self.found = true;
+            Ok(())
+        }
+    }
+    let mut visitor = FindSubquery { found: false };
+    let Ok(()) = visit::walk_select_statement(&mut visitor, query);
+    visitor.found
 }
 
 /// Rewrites that keep the query semantically equivalent, but are appropriate for deep caching.
@@ -398,6 +456,7 @@ pub fn rewrite_for_readyset(
         dialect,
         reordered_placeholders,
         auto_parameters,
+        slots,
     } = prev;
     assert_eq!(dialect, flags.dialect);
 
@@ -424,21 +483,23 @@ pub fn rewrite_for_readyset(
         limit_clause = %limit_clause.display(flags.dialect)
     );
 
-    let auto_parameters = if flags.autoparameterize {
-        let auto_parameters = autoparameterize::auto_parameterize_query(
-            query,
-            auto_parameters,
-            flags.server_supports_mixed_comparisons,
-            true,
-        )?;
-        trace!(parent: &span, pass="auto_parameterize_query", query = %query.display(flags.dialect), auto_parameters=?auto_parameters);
-        auto_parameters
-    } else {
-        trace!(parent: &span, pass = "auto_parameterize_query", skipped = true);
-        auto_parameters
-    };
-    // Both autoparameterization phases have honored any `AUTOPARAM (EXCLUDE_*)` markers; unwrap
-    // them so the final form holds plain literals.
+    // The first phase's slots, so a placeholder this walk reaches is still known to have been a
+    // literal that phase lifted. This walk also reaches positions the first one did not -- an
+    // OFFSET among them -- so its slots are the query's whole canonical space.
+    let AutoParameters {
+        params: auto_parameters,
+        slots,
+    } = autoparameterize::auto_parameterize_query(
+        query,
+        auto_parameters,
+        slots,
+        flags.autoparameterize,
+        flags.server_supports_mixed_comparisons,
+        true,
+    )?;
+    trace!(parent: &span, pass="auto_parameterize_query", query = %query.display(flags.dialect), auto_parameters=?auto_parameters, canonical_positions=slots.positions());
+    // Unwrap any `AUTOPARAM (EXCLUDE_*)` marker so the final form holds plain literals. Nothing
+    // in the product marks literals today; see `autoparam_exclusions`.
     autoparameterize::unwrap_all_preserved(query);
     let rewritten_in_conditions = collapse_where_in(query, flags.dialect)?;
     trace!(parent: &span, pass="collapse_where_in", query = %query.display(flags.dialect), rewritten_in_conditions=?rewritten_in_conditions);
@@ -482,6 +543,7 @@ pub fn rewrite_for_readyset(
             force_paginate_in_adapter,
         },
         post_lookup_plan,
+        slots,
     })
 }
 
@@ -767,6 +829,31 @@ impl ShallowQueryParameters {
 }
 
 impl DfQueryParameters {
+    /// A cache's parameters carrying a read's values.
+    ///
+    /// The pagination is the read's own. A limit clause the adapter applies is stripped before
+    /// the shape is taken, so the cache's view holds unbounded rows and the read's own limit
+    /// bounds them; a limit that stays in the statement is part of the shape, so only a read
+    /// asking for the same one reaches the cache at all.
+    ///
+    /// A read served this way carries no parameters of its own, so no placeholder order remains
+    /// to restore.
+    pub fn for_read(mut self, read: &Self, lookup: Vec<(usize, Literal)>) -> Self {
+        self.auto_parameters = lookup;
+        self.pagination_parameters = read.pagination_parameters.clone();
+        self.reordered_placeholders = None;
+        self
+    }
+
+    /// What the rewrite found at each of the query's canonical parameter positions.
+    ///
+    /// A cache's slots say which literals it keeps inline; a read's say what it carries. Matching
+    /// the two is how a read reaches a cache whose form it does not itself produce -- see
+    /// [`LiteralSlots::match_read`].
+    pub fn slots(&self) -> &LiteralSlots {
+        &self.slots
+    }
+
     /// If the query has values for OFFSET or LIMIT, get their values, returning a tuple of `limit,
     /// offset`
     pub fn limit_offset_params(
@@ -1303,6 +1390,82 @@ fn splice_auto_parameters<'param, T: Clone>(
     }
     res.extend(params.to_vec());
     Cow::Owned(res)
+}
+
+#[cfg(test)]
+mod reachability {
+    use readyset_sql::Dialect;
+
+    use super::inline_literals_are_reachable;
+
+    fn reachable(query: &str) -> bool {
+        reachable_in(Dialect::MySQL, query)
+    }
+
+    fn reachable_in(dialect: Dialect, query: &str) -> bool {
+        let stmt = readyset_sql_parsing::parse_select(dialect, query).unwrap();
+        inline_literals_are_reachable(&stmt, dialect).unwrap()
+    }
+
+    /// Without a placeholder the statement takes the same shape a read does, whatever it holds.
+    #[test]
+    fn a_statement_without_a_placeholder_is_always_reachable() {
+        assert!(reachable("SELECT v FROM t WHERE a = 1"));
+        assert!(reachable(
+            "SELECT d.v FROM (SELECT a, v FROM t) AS d WHERE d.a = 1"
+        ));
+        assert!(reachable(
+            "SELECT t.v FROM t JOIN u ON t.a = u.a WHERE t.a = 1"
+        ));
+        assert!(reachable(
+            "SELECT v FROM t WHERE a IN (SELECT a FROM u WHERE b = 1)"
+        ));
+    }
+
+    /// A placeholder is reachable where the structural passes have nothing to reshape.
+    #[test]
+    fn a_placeholder_in_a_single_table_statement_is_reachable() {
+        assert!(reachable("SELECT v FROM t WHERE a = ? AND b = 'x'"));
+        assert!(reachable("SELECT v FROM t WHERE a = ?"));
+    }
+
+    /// A MySQL client binds `?` however the cache was written, so a `$n` beside a join is as far
+    /// out of reach there as a `?` is. Accepting one and refusing the other is what REA-6928
+    /// reported: the `$n` cache was created and then never served.
+    #[test]
+    fn mysql_treats_a_dollar_placeholder_like_a_question_mark() {
+        let join = "SELECT t.v FROM t JOIN u ON t.a = u.a WHERE t.b = $1 AND u.c = 'x'";
+        assert!(!reachable_in(Dialect::MySQL, join));
+        let single = "SELECT v FROM t WHERE a = $1 AND b = 'x'";
+        assert!(reachable_in(Dialect::MySQL, single));
+    }
+
+    /// A Postgres client binds `$n`, which keeps the structural passes on both sides, so a `$n`
+    /// beside a join still lands on the shape a read produces.
+    #[test]
+    fn postgres_keeps_a_dollar_placeholder_reachable() {
+        assert!(reachable_in(
+            Dialect::PostgreSQL,
+            "SELECT t.v FROM t JOIN u ON t.a = u.a WHERE t.b = $1 AND u.c = 'x'"
+        ));
+    }
+
+    /// A placeholder beside a join or a subquery is not: those are what the passes reshape.
+    #[test]
+    fn a_placeholder_beside_a_join_or_subquery_is_unreachable() {
+        assert!(!reachable(
+            "SELECT d.v FROM (SELECT a, v FROM t) AS d WHERE d.a = ? AND d.b = 'x'"
+        ));
+        assert!(!reachable(
+            "SELECT t.v FROM t JOIN u ON t.a = u.a WHERE t.a = ?"
+        ));
+        assert!(!reachable(
+            "SELECT v FROM t WHERE a IN (SELECT a FROM u WHERE b = ?)"
+        ));
+        assert!(!reachable(
+            "SELECT v FROM t WHERE a = ? AND EXISTS (SELECT 1 FROM u WHERE u.a = t.a)"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2098,18 +2261,18 @@ mod tests {
             );
         }
 
-        /// Rewrite `query` with autoparameterization either on or off (the `AUTOPARAM OFF`
-        /// knob), returning the rewritten statement for output assertions.
-        fn rewrite_with_autoparam(
+        /// Rewrite `query` either the standard way, parameterizing every supported literal, or
+        /// keeping the literals its author wrote inline. Returns the rewritten statement.
+        fn rewrite_keeping_literals(
             query: &str,
             dialect: Dialect,
-            autoparameterize: bool,
+            keep_literals: bool,
         ) -> SelectStatement {
             let mut params = rewrite_params(dialect);
-            params.autoparameterize = autoparameterize;
+            params.autoparameterize = !keep_literals;
+            let context = rewrite_context(dialect);
             let mut query = parse_select_statement(query, dialect);
-            rewrite_query(&mut query, params, rewrite_context(dialect))
-                .expect("Should be able to rewrite query");
+            rewrite_query(&mut query, params, &context).expect("Should be able to rewrite query");
             query
         }
 
@@ -2122,41 +2285,144 @@ mod tests {
             );
         }
 
-        /// With `AUTOPARAM OFF`, the pass leaves every literal inline; the default still
-        /// autoparameterizes them. Same input, opposite output.
+        /// Keeping a query's literals leaves every one of them inline; the standard rewrite
+        /// parameterizes them. Same input, opposite output.
         #[test]
-        fn autoparam_off_preserves_literals() {
+        fn keeping_literals_leaves_them_inline() {
             let input =
                 "SELECT id FROM users WHERE credit_card_number = 'look at this PII' AND id = 3";
 
-            let on = rewrite_with_autoparam(input, Dialect::PostgreSQL, true);
+            let parameterized = rewrite_keeping_literals(input, Dialect::PostgreSQL, false);
             assert_rewrites_to(
-                &on,
+                &parameterized,
                 "SELECT users.id FROM users \
                  WHERE users.credit_card_number = $1 AND users.id = $2",
                 Dialect::PostgreSQL,
             );
 
-            let off = rewrite_with_autoparam(input, Dialect::PostgreSQL, false);
+            let kept = rewrite_keeping_literals(input, Dialect::PostgreSQL, true);
             assert_rewrites_to(
-                &off,
+                &kept,
                 "SELECT users.id FROM users \
                  WHERE users.credit_card_number = 'look at this PII' AND users.id = 3",
                 Dialect::PostgreSQL,
             );
         }
 
-        /// With `AUTOPARAM OFF`, literals the user left inline are preserved while the
-        /// placeholders they wrote by hand are still numbered normally.
+        /// Placeholders the author wrote by hand are still numbered normally alongside the
+        /// literals kept inline.
         #[test]
-        fn autoparam_off_keeps_user_placeholders() {
+        fn keeping_literals_leaves_hand_written_placeholders() {
             let input = "SELECT id FROM users WHERE credit_card_number = 'pii' AND id = $1";
-            let off = rewrite_with_autoparam(input, Dialect::PostgreSQL, false);
+            let kept = rewrite_keeping_literals(input, Dialect::PostgreSQL, true);
             assert_rewrites_to(
-                &off,
+                &kept,
                 "SELECT users.id FROM users WHERE users.credit_card_number = 'pii' AND users.id = $1",
                 Dialect::PostgreSQL,
             );
+        }
+
+        /// What the mechanism is for. A cache written with one position spelled out and another
+        /// left to a placeholder is reached by an ad-hoc read that spells the same literal out:
+        /// the two share a canonical shape, and matching the read's literals against the cache's
+        /// says the read belongs to it and which of its values key the lookup.
+        #[test]
+        fn a_literal_read_reaches_a_cache_that_kept_its_literal() {
+            let dialect = Dialect::PostgreSQL;
+            let context = rewrite_context(dialect);
+            let params = rewrite_params(dialect);
+
+            let canonical = |query: &str| {
+                let mut q = parse_select_statement(query, dialect);
+                let p = rewrite_query(&mut q, params, &context).unwrap();
+                (q.display(dialect).to_string(), p.slots().clone())
+            };
+
+            let cache = "SELECT id FROM users WHERE name = $1 AND status = 'active'";
+            let read = "SELECT id FROM users WHERE name = 'bob' AND status = 'active'";
+            let (cache_shape, cache_slots) = canonical(cache);
+            let (read_shape, read_slots) = canonical(read);
+            assert_eq!(
+                read_shape, cache_shape,
+                "the read and the cache have to share a canonical shape",
+            );
+
+            let matched = cache_slots
+                .match_read(&read_slots)
+                .expect("the read spells out the literal the cache kept");
+            assert_eq!(matched, vec![(0, "bob".into())]);
+
+            // A different value where the cache kept a literal belongs to another cache.
+            let (_, other) =
+                canonical("SELECT id FROM users WHERE name = 'bob' AND status = 'archived'");
+            assert!(cache_slots.match_read(&other).is_none());
+        }
+
+        /// The canonical shape a query hashes to, and what it carried at each position.
+        fn canonical_of(query: &str, dialect: Dialect) -> (String, LiteralSlots) {
+            let mut q = parse_select_statement(query, dialect);
+            let p = rewrite_query(&mut q, rewrite_params(dialect), rewrite_context(dialect))
+                .expect("Should be able to rewrite query");
+            (q.display(dialect).to_string(), p.slots().clone())
+        }
+
+        /// A cache keeping one position of a row comparison inline is a form no ordinary rewrite
+        /// produces: it turns a row of literals into a row of placeholders or leaves it alone.
+        /// The server refuses to drop a position it cannot make a parameter of, so the predicate
+        /// survives.
+        #[test]
+        fn a_row_can_keep_one_position_inline() {
+            let dialect = Dialect::PostgreSQL;
+            let cache = "SELECT id FROM t3 WHERE (x, y, z) = ($1, 5, $2)";
+
+            let form = rewrite_keeping_literals(cache, dialect, true);
+            assert_rewrites_to(
+                &form,
+                "SELECT id FROM t3 WHERE (t3.x, t3.y, t3.z) = ($1, 5, $2)",
+                dialect,
+            );
+
+            // Its canonical run reports a literal only where the author spelled one out.
+            let (_, slots) = canonical_of(cache, dialect);
+            assert_eq!(slots, vec![None, Some(5.into()), None].into());
+        }
+
+        /// `collapse_where_in` folds every `IN` arity into one shape, so a read can hash to a
+        /// cache's shape while carrying a different number of positions. The position count is
+        /// what says the two are different queries.
+        #[test]
+        fn an_in_list_of_another_length_shares_the_shape_but_not_the_slots() {
+            let dialect = Dialect::PostgreSQL;
+            let cache = "SELECT id FROM users WHERE name IN ($1, $2) AND status = 'active'";
+            let (cache_shape, cache_slots) = canonical_of(cache, dialect);
+
+            for read in [
+                "SELECT id FROM users WHERE name IN ('a', 'b', 'c') AND status = 'active'",
+                "SELECT id FROM users WHERE name IN ('a') AND status = 'active'",
+            ] {
+                let (read_shape, read_slots) = canonical_of(read, dialect);
+                assert_eq!(
+                    read_shape, cache_shape,
+                    "the arity is folded away, so the shapes match: {read}",
+                );
+                assert_ne!(
+                    read_slots.positions(),
+                    cache_slots.positions(),
+                    "and the position count is what tells them apart: {read}",
+                );
+                assert!(
+                    cache_slots.match_read(&read_slots).is_none(),
+                    "so the read belongs to no cache: {read}",
+                );
+            }
+
+            // The read of the cache's own arity belongs to it.
+            let (_, same_arity) = canonical_of(
+                "SELECT id FROM users WHERE name IN ('a', 'b') AND status = 'active'",
+                dialect,
+            );
+            assert_eq!(same_arity.positions(), cache_slots.positions());
+            assert!(cache_slots.match_read(&same_arity).is_some());
         }
 
         /// `wrap_autoparam_exclusions` + the full rewrite keep the excluded literal inline,
@@ -2333,12 +2599,13 @@ mod tests {
             );
         }
 
-        /// `AUTOPARAM OFF` only suppresses autoparameterization; the rest of the pass (here,
-        /// reordering hand-written `$N` placeholders into positional order) still runs.
+        /// Keeping a query's literals inline reaches only autoparameterization; the rest of the
+        /// pipeline (here, reordering hand-written `$N` placeholders into positional order) runs
+        /// either way.
         #[test]
-        fn autoparam_off_still_reorders_placeholders() {
+        fn keeping_literals_still_reorders_placeholders() {
             let input = "SELECT x FROM t WHERE x = $2 AND y = $1";
-            let off = rewrite_with_autoparam(input, Dialect::PostgreSQL, false);
+            let off = rewrite_keeping_literals(input, Dialect::PostgreSQL, true);
             assert_rewrites_to(
                 &off,
                 "SELECT t.x FROM t WHERE t.x = $1 AND t.y = $2",
