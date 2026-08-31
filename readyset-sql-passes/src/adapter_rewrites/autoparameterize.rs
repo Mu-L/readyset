@@ -1571,4 +1571,187 @@ mod tests {
             );
         }
     }
+
+    /// A query's slots say what it held at each canonical position, which is what lets a read
+    /// reach a cache whose form it does not produce on its own.
+    mod slots {
+        use super::*;
+
+        fn slots_of(query: &str, dialect: Dialect) -> LiteralSlots {
+            let mut query = parse_select_statement(query, dialect);
+            auto_parameterize_query(
+                &mut query,
+                Vec::new(),
+                LiteralSlots::default(),
+                true,
+                false,
+                true,
+            )
+            .unwrap()
+            .slots
+        }
+
+        /// Every query is its own cache: read by the text it was created from, each literal it
+        /// spells out identifies it and nothing keys a lookup.
+        #[test]
+        fn a_query_matches_itself() {
+            for query in [
+                "SELECT * FROM t WHERE a = 1",
+                "SELECT * FROM t WHERE a = ?",
+                "SELECT * FROM t WHERE a = 1 AND b = ?",
+                "SELECT * FROM t WHERE a = ? AND b = 2",
+                "SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3",
+                "SELECT * FROM t WHERE a > 1 AND b < 2",
+                "SELECT * FROM t WHERE a IN (1, 2, 3)",
+                "SELECT * FROM t WHERE a IN (?, ?, ?)",
+                "SELECT * FROM t WHERE (x, y) = ('a', 1)",
+                "SELECT * FROM t WHERE (x, y) = (?, 1)",
+                "SELECT * FROM t WHERE a = 1 LIMIT 3 OFFSET 6",
+                "SELECT * FROM t WHERE a = 1 ORDER BY b LIMIT 3 OFFSET ?",
+            ] {
+                let slots = slots_of(query, Dialect::MySQL);
+                let matched = slots
+                    .match_read(&slots)
+                    .unwrap_or_else(|| panic!("`{query}` does not match itself"));
+                assert!(
+                    matched.is_empty(),
+                    "`{query}` keys a lookup with {:?}",
+                    matched,
+                );
+            }
+        }
+
+        /// The behaviour the whole mechanism exists for: a read spelling out a value where the
+        /// cache parameterized reaches it, and that value keys the lookup.
+        #[test]
+        fn a_spelled_out_value_keys_the_lookup() {
+            let cache = slots_of("SELECT * FROM t WHERE a = ? AND b = 2", Dialect::MySQL);
+            let read = slots_of("SELECT * FROM t WHERE a = 1 AND b = 2", Dialect::MySQL);
+            let matched = cache
+                .match_read(&read)
+                .expect("the read belongs to the cache");
+            assert_eq!(matched, vec![(0, 1.into())]);
+        }
+
+        /// The key indexes the cache's own parameters rather than canonical positions, so a
+        /// literal the cache keeps ahead of one it parameterized must not shift what follows.
+        #[test]
+        fn an_inline_literal_before_a_parameter_keys_from_zero() {
+            let cache = slots_of("SELECT * FROM t WHERE b = 2 AND a = ?", Dialect::MySQL);
+            let read = slots_of("SELECT * FROM t WHERE b = 2 AND a = 1", Dialect::MySQL);
+            let matched = cache
+                .match_read(&read)
+                .expect("the read belongs to the cache");
+            assert_eq!(matched, vec![(0, 1.into())]);
+        }
+
+        /// A different value where the cache keeps a literal is a different query.
+        #[test]
+        fn a_differing_literal_belongs_to_another_cache() {
+            let cache = slots_of("SELECT * FROM t WHERE a = ? AND b = 2", Dialect::MySQL);
+            let read = slots_of("SELECT * FROM t WHERE a = 1 AND b = 3", Dialect::MySQL);
+            assert!(cache.match_read(&read).is_none());
+        }
+
+        /// A cache with a literal baked in cannot serve a client that wants to bind that position
+        /// at execution.
+        #[test]
+        fn a_baked_literal_cannot_serve_a_bind_position() {
+            let cache = slots_of("SELECT * FROM t WHERE a = ? AND b = 2", Dialect::MySQL);
+            let read = slots_of("SELECT * FROM t WHERE a = 1 AND b = ?", Dialect::MySQL);
+            assert!(cache.match_read(&read).is_none());
+        }
+
+        /// A fully parameterized cache takes every value of every position, and all of them key
+        /// the lookup.
+        #[test]
+        fn a_parameterized_cache_takes_any_value() {
+            let cache = slots_of("SELECT * FROM t WHERE a = ? AND b = ?", Dialect::MySQL);
+            let read = slots_of("SELECT * FROM t WHERE a = 1 AND b = 2", Dialect::MySQL);
+            let matched = cache
+                .match_read(&read)
+                .expect("every position takes a value");
+            assert_eq!(matched, vec![(0, 1.into()), (1, 2.into())]);
+        }
+
+        /// `collapse_where_in` folds every `IN` arity into one shape, so a read can reach this
+        /// point carrying more positions than the cache has. The position count is what says the
+        /// two are different queries.
+        #[test]
+        fn a_differing_in_arity_belongs_to_another_cache() {
+            let cache = slots_of("SELECT * FROM t WHERE a IN (1, 2)", Dialect::MySQL);
+            let read = slots_of("SELECT * FROM t WHERE a IN (1, 2, 3)", Dialect::MySQL);
+            assert_ne!(cache.positions(), read.positions());
+            assert!(cache.match_read(&read).is_none());
+        }
+
+        /// `collapse_where_in` folds every list into one predicate, so two queries whose lists
+        /// hold the same literals in different groupings reach the same shape and the same
+        /// position count. The grouping is what separates them.
+        #[test]
+        fn a_regrouped_in_list_belongs_to_another_cache() {
+            let cache = slots_of(
+                "SELECT * FROM t WHERE a IN (1, 2) AND b IN (3)",
+                Dialect::MySQL,
+            );
+            let read = slots_of(
+                "SELECT * FROM t WHERE a IN (1) AND b IN (2, 3)",
+                Dialect::MySQL,
+            );
+            assert_eq!(cache.positions(), read.positions());
+            assert!(cache.match_read(&read).is_none());
+        }
+
+        /// A run of the same length sitting at a different position is a different query, so the
+        /// run's start has to count as much as its length. Both of these hold the same three
+        /// literals and reach the same shape.
+        #[test]
+        fn a_shifted_in_list_belongs_to_another_cache() {
+            let cache = slots_of(
+                "SELECT * FROM t WHERE x IN (1, 2) AND y = 3",
+                Dialect::MySQL,
+            );
+            let read = slots_of(
+                "SELECT * FROM t WHERE x = 1 AND y IN (2, 3)",
+                Dialect::MySQL,
+            );
+            assert_eq!(cache.positions(), read.positions());
+            assert!(cache.match_read(&read).is_none());
+        }
+
+        /// The same, with the run shifting past a plain equality between two lists.
+        #[test]
+        fn a_run_shifting_past_an_equality_belongs_to_another_cache() {
+            let cache = slots_of(
+                "SELECT * FROM t WHERE a IN (1, 2) AND b = 3 AND c IN (4, 5)",
+                Dialect::MySQL,
+            );
+            let read = slots_of(
+                "SELECT * FROM t WHERE a = 1 AND b IN (2, 3) AND c IN (4, 5)",
+                Dialect::MySQL,
+            );
+            assert_eq!(cache.positions(), read.positions());
+            assert!(cache.match_read(&read).is_none());
+        }
+
+        /// A list the author wrote as placeholders lifts nothing, so its grouping is taken where
+        /// the walk sees the list rather than where a literal is lifted.
+        #[test]
+        fn a_placeholder_in_list_is_grouped_like_a_literal_one() {
+            let cache = slots_of(
+                "SELECT * FROM t WHERE a IN (?, ?) AND b IN (?)",
+                Dialect::MySQL,
+            );
+            let read = slots_of(
+                "SELECT * FROM t WHERE a IN (1, 2) AND b IN (3)",
+                Dialect::MySQL,
+            );
+            assert!(cache.match_read(&read).is_some());
+            let regrouped = slots_of(
+                "SELECT * FROM t WHERE a IN (1) AND b IN (2, 3)",
+                Dialect::MySQL,
+            );
+            assert!(cache.match_read(&regrouped).is_none());
+        }
+    }
 }
