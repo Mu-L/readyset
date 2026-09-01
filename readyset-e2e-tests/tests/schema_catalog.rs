@@ -154,11 +154,7 @@ async fn explain_create_cache_errors_when_catalog_is_stale() {
         .get(2)
         .unwrap();
 
-    assert!(
-        supported.starts_with("no"),
-        "expected supported to start with \"no\", got: {supported}"
-    );
-    assert_schema_generation_error!(supported);
+    assert_eq!(supported, "pending");
 
     // Let adapter catch up after the delayed update applies
     sleep(CATALOG_UPDATE_APPLY_WAIT).await;

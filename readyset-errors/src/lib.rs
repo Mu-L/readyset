@@ -850,6 +850,7 @@ impl ReadySetError {
                     | Self::ControllerUnavailable
                     | Self::RequestTimeout
                     | Self::RequestTimeoutWithContext(..)
+                    | Self::SchemaGenerationMismatch { .. }
             )
         }) {
             return true;
