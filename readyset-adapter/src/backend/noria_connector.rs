@@ -347,6 +347,27 @@ pub(crate) enum ExecuteSelectContext<'ctx> {
         processed_query_params: DfQueryParameters,
         schema_generation: SchemaGeneration,
     },
+    /// An execute served from a cache keeping its literals inline: `values` fill the cache's
+    /// parameters in its order, and the pagination is the execute's own.
+    InlineLiteral {
+        name: &'ctx Relation,
+        params: &'ctx DfQueryParameters,
+        values: &'ctx [DfValue],
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
+}
+
+/// Where an [`ExecuteSelectContext`]'s lookup keys come from.
+enum Keys<'a> {
+    /// The client's parameters in its own order, which the query's parameters turn into keys.
+    Client(&'a [DfValue]),
+    /// Values already at the query's canonical positions, with the pagination settled.
+    Canonical {
+        values: &'a [DfValue],
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
 }
 
 impl NoriaConnector {
@@ -1589,7 +1610,7 @@ impl NoriaConnector {
         event: &mut readyset_client_metrics::QueryExecutionEvent,
     ) -> ReadySetResult<QueryResult<'_>> {
         let start = event.recording.then(Instant::now);
-        let (qname, processed_query_params, params) = match ctx {
+        let (qname, processed_query_params, keys) = match ctx {
             ExecuteSelectContext::Prepared {
                 ps:
                     PreparedSelectStatement {
@@ -1600,7 +1621,22 @@ impl NoriaConnector {
             } => (
                 Cow::Borrowed(name),
                 Cow::Borrowed(processed_query_params),
+                Keys::Client(params),
+            ),
+            ExecuteSelectContext::InlineLiteral {
+                name,
                 params,
+                values,
+                limit,
+                offset,
+            } => (
+                Cow::Borrowed(name),
+                Cow::Borrowed(params),
+                Keys::Canonical {
+                    values,
+                    limit,
+                    offset,
+                },
             ),
             ExecuteSelectContext::AdHoc {
                 statement,
@@ -1620,7 +1656,7 @@ impl NoriaConnector {
                 (
                     Cow::Owned(name),
                     Cow::Owned(processed_query_params),
-                    &[][..],
+                    Keys::Client(&[]),
                 )
             }
         };
@@ -1629,8 +1665,21 @@ impl NoriaConnector {
         let getter = self.inner.get_noria_view(&qname, view_failed).await?;
 
         let plan = processed_query_params.post_lookup_plan();
-        let (limit, offset) = processed_query_params.limit_offset_params(params)?;
-        let raw_keys = processed_query_params.make_keys(params)?;
+        let (limit, offset, raw_keys) = match keys {
+            Keys::Client(params) => {
+                let (limit, offset) = processed_query_params.limit_offset_params(params)?;
+                (limit, offset, processed_query_params.make_keys(params)?)
+            }
+            Keys::Canonical {
+                values,
+                limit,
+                offset,
+            } => (
+                limit,
+                offset,
+                processed_query_params.make_keys_from_canonical(values)?,
+            ),
+        };
         let res = readyset_client::read::read_cache(
             getter,
             self.read_request_handler

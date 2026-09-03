@@ -647,15 +647,11 @@ async fn a_placeholder_in_a_nested_statement_is_refused() {
 /// A cache that keeps its literals inline is reached by an ad-hoc read, which carries its
 /// literals as text.
 ///
-/// Disabled, and known to fail. A prepared statement's values arrive at execute, after the form
-/// it was planned against is fixed, so the literals that pick the cache are not in hand when the
-/// plan is made. Closing this means matching at execute, where the statement id is known and can
-/// name the form to use. The test is kept as the specification.
+/// A prepared statement spelling out the literal the cache kept reaches it, with its bound value
+/// keying the lookup, the same way the ad-hoc form does.
 #[tokio::test]
 #[tags(serial)]
 #[upstream(mysql)]
-#[ignore = "a prepared statement is planned before its values arrive, so it cannot pick a cache \
-            by them yet"]
 async fn a_prepared_read_reaches_a_per_cache_off_cache() {
     let (mut rs_conn, _upstream, _handle, shutdown_tx) =
         adapter("autoparam_mode_prepared_pc", T).await;
@@ -686,6 +682,135 @@ async fn a_prepared_read_reaches_a_per_cache_off_cache() {
 
     shutdown_tx.shutdown().await;
 }
+
+
+/// The cache's parameters take their values from two places at once: a position this statement
+/// spells out is filled from its literal, and one it binds is filled by the client. They have to
+/// interleave in the cache's own parameter order, which only shows when the two differ.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_read_interleaves_its_literals_with_its_bound_values() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_prepared_mix", T).await;
+
+    // Two parameterized positions and one kept inline, so a read can spell out either parameter
+    // and bind the other.
+    rs_conn
+        .query_drop(
+            "CREATE CACHE mixed WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND v = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let served = QueryDestination::Readyset(Some("mixed".into()));
+
+    // `id` spelled out, `v` bound: the literal fills the cache's first parameter and the client's
+    // value fills the second.
+    let rows: Vec<i32> = rs_conn
+        .exec(
+            "SELECT v FROM t WHERE id = 1 AND v = ? AND status = 'active'",
+            (10,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, served.clone()).await;
+
+    // A value matching no row still reaches the cache, which is what says the key was built in
+    // the right order rather than landing on another row by luck.
+    let rows: Vec<i32> = rs_conn
+        .exec(
+            "SELECT v FROM t WHERE id = 1 AND v = ? AND status = 'active'",
+            (30,),
+        )
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+    assert_last_target_was(&mut rs_conn, served.clone()).await;
+
+    // The other way round: `v` spelled out, `id` bound. The same cache, the opposite interleave.
+    let rows: Vec<i32> = rs_conn
+        .exec(
+            "SELECT v FROM t WHERE id = ? AND v = 10 AND status = 'active'",
+            (1,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, served).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A statement binding the position the cache kept inline is matched by the value it binds, at
+/// execute: the value the cache kept reaches it, another goes upstream.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_read_binding_a_kept_position_is_matched_by_its_value() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_prepared_bind", T).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let read = "SELECT v FROM t WHERE id = ? AND status = ?";
+    let rows: Vec<i32> = rs_conn.exec(read, (1, "active")).await.unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    let rows: Vec<i32> = rs_conn.exec(read, (1, "archived")).await.unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Caching a few hot values of a key the application binds: one prepared statement lands on a
+/// different cache per execute, and upstream for a value no cache kept.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn one_prepared_statement_reaches_a_different_cache_per_bound_value() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_prepared_values", T).await;
+
+    for (name, status) in [("act", "active"), ("arc", "archived")] {
+        rs_conn
+            .query_drop(format!(
+                "CREATE CACHE {name} WITH (AUTOPARAM OFF) \
+                 FROM SELECT v FROM t WHERE status = '{status}' ORDER BY v"
+            ))
+            .await
+            .unwrap();
+    }
+    sleep().await;
+
+    let read = "SELECT v FROM t WHERE status = ? ORDER BY v";
+    let rows: Vec<i32> = rs_conn.exec(read, ("active",)).await.unwrap();
+    assert_eq!(rows, vec![10, 30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("act".into()))).await;
+
+    let rows: Vec<i32> = rs_conn.exec(read, ("archived",)).await.unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("arc".into()))).await;
+
+    let rows: Vec<i32> = rs_conn.exec(read, ("pending",)).await.unwrap();
+    assert_eq!(rows, vec![40]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
 
 /// Rows enough that every limit in the TopK tests is a real bound: three per status, ordered by
 /// `v`, and a `pending` row so a read that matches no cache still proves the upstream answered.
@@ -895,6 +1020,88 @@ async fn an_orderless_limit_read_takes_one_shape() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert!([20, 40, 60].contains(&rows[0]), "an archived row, from upstream: {rows:?}");
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// The prepared form of the TopK reads: a statement spelling its limit out under an `ORDER BY`
+/// reaches the cache that kept that limit, and another limit is another query.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_topk_read_reaches_the_cache_that_kept_its_limit() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_prepared_kept", TK).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE lit WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let rows: Vec<i32> = rs_conn
+        .exec("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2", ())
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10, 30]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lit".into()))).await;
+
+    let rows: Vec<i32> = rs_conn
+        .exec("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 1", ())
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A prepared statement is matched under the same two shapes an ad-hoc read tries. One binding
+/// its limit needs only the first: its own rewrite strips the placeholder, which is the shape the
+/// cache is filed under. One spelling the limit out keeps it in its first shape and finds the
+/// cache under the second, with its own limit bounding the rows.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_literal_limit_read_reaches_a_cache_with_a_placeholder_limit() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_prepared_par", TK).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE par WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    let served = QueryDestination::Readyset(Some("par".into()));
+
+    let rows: Vec<i32> = rs_conn
+        .exec("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?", (1,))
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20]);
+    assert_last_target_was(&mut rs_conn, served.clone()).await;
+
+    let rows: Vec<i32> = rs_conn
+        .exec("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2", ())
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![20, 40]);
+    assert_last_target_was(&mut rs_conn, served).await;
+
+    // A literal the cache did not keep matches nothing on either attempt.
+    let rows: Vec<i32> = rs_conn
+        .exec("SELECT v FROM t WHERE status = 'pending' ORDER BY v LIMIT 1", ())
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![70]);
     assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;

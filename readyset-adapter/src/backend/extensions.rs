@@ -1774,7 +1774,8 @@ where
                         registration.slots,
                         registration.request,
                         registration.params,
-                    );
+                        *trx_cache_policy,
+                    )?;
                 }
                 created_cache
             }

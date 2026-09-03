@@ -20,8 +20,11 @@ use tracing::warn;
 use readyset_client::query::*;
 use readyset_client::{ShallowViewRequest, ViewCreateRequest};
 use readyset_data::DfValue;
+use readyset_errors::ReadySetResult;
 use readyset_sql::ast::{CacheType, Relation, SqlIdentifier, TrxCachePolicy};
-use readyset_sql_passes::adapter_rewrites::{CacheLookupKey, DfQueryParameters, LiteralSlots};
+use readyset_sql_passes::adapter_rewrites::{
+    CacheLookupKey, DfQueryParameters, LiteralSlots, ValueSlots,
+};
 
 use schema_catalog::{SchemaChangeHandler, SchemaGeneration};
 
@@ -112,22 +115,49 @@ pub struct QueryStatusCache {
 /// A cache that keeps some of its author's literals inline, and what a read needs to reach it.
 #[derive(Debug, Clone)]
 pub(crate) struct InlineLiteralCache {
-    /// What the cache holds at each canonical parameter position. A read whose own slots match
-    /// belongs to this cache; see [`LiteralSlots::match_read`].
+    /// What the cache holds at each canonical parameter position. An ad-hoc read whose own slots
+    /// match belongs to this cache; see [`LiteralSlots::match_read`].
     pub(crate) slots: LiteralSlots,
+    /// The same positions as values, which an execute is matched by; see [`ValueSlots::match_values`].
+    pub(crate) values: ValueSlots,
     /// The cache's own form, which a matching read is served from. It is kept because no read
     /// produces this form, so there is nothing to derive it from later.
     ///
-    /// Shared, so a lookup takes it while holding the map's guard and pays for a copy of it, if
-    /// it needs one at all, once the guard is gone.
+    /// Shared, so a lookup takes it while holding the map's guard and pays for a copy of it,
+    /// if it needs one at all, once the guard is gone.
     pub(crate) request: Arc<ViewCreateRequest>,
+    /// The id of that form, which is what a read served from it is logged under.
+    pub(crate) query_id: QueryId,
     /// The cache's parameters. Everything but the values they carry is a property of its form, so
-    /// a matching read substitutes only the literals its own positions hold. Shared for the same
-    /// reason as the form beside it.
+    /// a matching read substitutes only the values its own positions hold.
     pub(crate) params: Arc<DfQueryParameters>,
+    /// The view an execute is sent to: one of the names claiming the entry.
+    pub(crate) name: Relation,
+    pub(crate) trx_cache_policy: TrxCachePolicy,
     /// The caches registered here. Two agreeing on every position share the entry, which lives
     /// as long as one of them does, so a DROP CACHE gives up only its own claim.
     pub(crate) caches: HashSet<Relation>,
+}
+
+/// What serving a prepared statement's execute from a cache keeping its author's literals inline
+/// needs: the cache's view and parameters, and the values this execute puts in them.
+#[derive(Debug)]
+pub struct InlineLiteralHit {
+    pub name: Relation,
+    pub query_id: QueryId,
+    pub trx_cache_policy: TrxCachePolicy,
+    pub params: Arc<DfQueryParameters>,
+    pub values: Vec<DfValue>,
+}
+
+/// A miss is how a read whose values no cache kept reaches the upstream, so from outside it is
+/// indistinguishable from the feature being broken.
+fn record_inline_literal_lookup(hit: bool) {
+    counter!(
+        metric::INLINE_LITERAL_CACHE_LOOKUPS,
+        "result" => if hit { "hit" } else { "miss" },
+    )
+    .increment(1);
 }
 
 #[derive(Debug)]
@@ -469,10 +499,42 @@ impl QueryStatusCache {
         CacheLookupKey,
     )> {
         let caches = self.inline_literal_caches.get(shape)?;
-        caches.value().iter().find_map(|cache| {
+        let matched = caches.value().iter().find_map(|cache| {
             let matched = cache.slots.match_read(read)?;
-            Some((cache.request.clone(), cache.params.clone(), matched))
-        })
+            // Shared handles, so the copies a hit needs are made once the guard is gone.
+            Some((
+                Arc::clone(&cache.request),
+                Arc::clone(&cache.params),
+                matched,
+            ))
+        });
+        record_inline_literal_lookup(matched.is_some());
+        matched
+    }
+
+    /// The cache under `shape` that an execute belongs to given the values at its canonical
+    /// positions, and what serving it needs. `values` is asked for only when a cache is filed
+    /// under the shape.
+    pub fn match_inline_literal_values(
+        &self,
+        shape: &QueryId,
+        read: &LiteralSlots,
+        values: impl FnOnce() -> Option<Vec<DfValue>>,
+    ) -> Option<InlineLiteralHit> {
+        let caches = self.inline_literal_caches.get(shape)?;
+        let values = values()?;
+        let matched = caches.value().iter().find_map(|cache| {
+            let values = cache.values.match_values(read, &values)?;
+            Some(InlineLiteralHit {
+                name: cache.name.clone(),
+                query_id: cache.query_id,
+                trx_cache_policy: cache.trx_cache_policy,
+                params: Arc::clone(&cache.params),
+                values,
+            })
+        });
+        record_inline_literal_lookup(matched.is_some());
+        matched
     }
 
     /// Register a cache that keeps literals inline. A cache agreeing with one already registered
@@ -484,7 +546,9 @@ impl QueryStatusCache {
         slots: LiteralSlots,
         request: ViewCreateRequest,
         params: DfQueryParameters,
-    ) {
+        trx_cache_policy: TrxCachePolicy,
+    ) -> ReadySetResult<()> {
+        let values = slots.to_values(params.dialect())?;
         let mut caches = self.inline_literal_caches.entry(shape).or_default();
         match caches.iter_mut().find(|cache| cache.slots == slots) {
             Some(cache) => {
@@ -497,8 +561,12 @@ impl QueryStatusCache {
                     .fetch_add(1, atomic::Ordering::Release);
                 caches.push(InlineLiteralCache {
                     slots,
+                    values,
+                    query_id: QueryId::from(&request),
                     request: Arc::new(request),
                     params: Arc::new(params),
+                    name: name.clone(),
+                    trx_cache_policy,
                     caches: HashSet::from([name]),
                 });
                 // A read tries these in order, so the one holding the most literals wins a read
@@ -512,6 +580,7 @@ impl QueryStatusCache {
                 });
             }
         }
+        Ok(())
     }
 
     /// Whether the cache called `name` keeps some of its author's literals inline.
@@ -535,6 +604,12 @@ impl QueryStatusCache {
         self.inline_literal_caches.retain(|_, caches| {
             caches.retain_mut(|cache| {
                 cache.caches.remove(name);
+                // An execute is sent to a view a name still claims.
+                if cache.name == *name
+                    && let Some(other) = cache.caches.iter().next()
+                {
+                    cache.name = other.clone();
+                }
                 let claimed = !cache.caches.is_empty();
                 gone += usize::from(!claimed);
                 claimed
@@ -2306,14 +2381,174 @@ mod tests {
             "{query} keeps no literal inline, so it would need no entry"
         );
         let (form, params) = rewrite(query, false);
-        cache.register_inline_literal_cache(
-            shape,
-            Relation::from(name),
-            canonical.slots().clone(),
-            ViewCreateRequest::new(form, vec![]),
-            params,
-        );
+        cache
+            .register_inline_literal_cache(
+                shape,
+                Relation::from(name),
+                canonical.slots().clone(),
+                ViewCreateRequest::new(form, vec![]),
+                params,
+                TrxCachePolicy::default(),
+            )
+            .unwrap();
         shape
+    }
+
+    /// A prepared statement binding a position the cache kept inline is matched by the value it
+    /// binds, so one statement reaches a different cache per execute.
+    #[test]
+    fn an_execute_is_matched_by_its_bound_values() {
+        let cache = QueryStatusCache::new();
+        let shape = register(&cache, "two", "SELECT v FROM t WHERE a = ? AND b = 2");
+        register(&cache, "three", "SELECT v FROM t WHERE a = ? AND b = 3");
+        let read = read_slots("SELECT v FROM t WHERE a = ? AND b = ?");
+
+        let hit = cache
+            .match_inline_literal_values(&shape, &read, || Some(vec![1.into(), 2.into()]))
+            .expect("binding the literal the cache kept reaches it");
+        assert_eq!(hit.name, Relation::from("two"));
+        assert_eq!(
+            hit.values,
+            vec![DfValue::from(1)],
+            "the cache's own parameter"
+        );
+
+        let hit = cache
+            .match_inline_literal_values(&shape, &read, || Some(vec![1.into(), 3.into()]))
+            .expect("another value reaches the cache that kept it");
+        assert_eq!(hit.name, Relation::from("three"));
+
+        assert!(
+            cache
+                .match_inline_literal_values(&shape, &read, || Some(vec![1.into(), 4.into()]))
+                .is_none(),
+            "a value no cache kept belongs to none of them"
+        );
+    }
+
+    /// A bound value reaches the cache keeping the same value, whatever type either side holds,
+    /// and none keeping another. The bound value is converted to the kept literal's type, so a
+    /// conversion that cannot hold it exactly is a miss.
+    #[test]
+    fn a_bound_value_reaches_the_cache_keeping_the_same_value() {
+        // One cache, keeping `kept` at its second position. An execute binding that position
+        // reaches the cache for each of `hits` and nothing for each of `misses`.
+        fn keeping(kept: &str, hits: &[DfValue], misses: &[DfValue]) {
+            let cache = QueryStatusCache::new();
+            let shape = register(
+                &cache,
+                "kept",
+                &format!("SELECT v FROM t WHERE a = ? AND b = {kept}"),
+            );
+            let read = read_slots("SELECT v FROM t WHERE a = ? AND b = ?");
+            let matched = |bound: &DfValue| {
+                cache.match_inline_literal_values(&shape, &read, || {
+                    Some(vec![7.into(), bound.clone()])
+                })
+            };
+            for bound in hits {
+                let hit = matched(bound)
+                    .unwrap_or_else(|| panic!("{bound:?} should reach the cache keeping {kept}"));
+                assert_eq!(hit.values, vec![DfValue::from(7)]);
+            }
+            for bound in misses {
+                assert!(
+                    matched(bound).is_none(),
+                    "{bound:?} should not reach the cache keeping {kept}"
+                );
+            }
+        }
+        let bytes = |s: &str| DfValue::from(s.as_bytes().to_vec());
+
+        // A MySQL client binds a string as bytes and a Postgres client as text. The kept literal
+        // carries its dialect's default collation, which is what decides case.
+        keeping(
+            "'x'",
+            &[
+                bytes("x"),
+                DfValue::from("x"),
+                bytes("X"),
+                DfValue::from("X"),
+            ],
+            &[bytes("x ")],
+        );
+        keeping(
+            "'a string longer than fourteen bytes'",
+            &[bytes("a string longer than fourteen bytes")],
+            &[bytes("a string longer than fourteen byte")],
+        );
+        // A binary literal is bytes on both sides.
+        keeping("X'79'", &[bytes("y")], &[bytes("x")]);
+        // Numbers compare by value, whichever variant carries them. 3.4 cannot be held as 3, so
+        // it is a miss rather than a rounded match.
+        keeping(
+            "3",
+            &[
+                DfValue::Int(3),
+                DfValue::UnsignedInt(3),
+                DfValue::Double(3.0),
+                DfValue::from("3"),
+                bytes("3"),
+            ],
+            &[DfValue::Int(4), DfValue::Double(3.4), DfValue::Float(3.4)],
+        );
+        keeping(
+            "2.5",
+            &[DfValue::Double(2.5), DfValue::Float(2.5), bytes("2.5")],
+            &[DfValue::Double(2.4)],
+        );
+        keeping("TRUE", &[DfValue::Int(1)], &[DfValue::Int(0)]);
+        // A date kept as text takes the text a client binds for it; a timestamp renders with a
+        // time of day, which the kept literal does not carry.
+        let day = |d: u32| {
+            DfValue::TimestampTz(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, d)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .into(),
+            )
+        };
+        keeping(
+            "'2024-01-01'",
+            &[DfValue::from("2024-01-01")],
+            &[day(1), day(2)],
+        );
+    }
+
+    #[test]
+    fn an_execute_over_a_shape_holding_no_cache_asks_for_no_values() {
+        let cache = QueryStatusCache::new();
+        register(&cache, "kept", "SELECT v FROM t WHERE a = 1");
+        let other = QueryId::from_select(&rewrite("SELECT v FROM u WHERE a = 1", true).0, &[]);
+        let read = read_slots("SELECT v FROM u WHERE a = ?");
+        let asked = std::cell::Cell::new(false);
+        assert!(
+            cache
+                .match_inline_literal_values(&other, &read, || {
+                    asked.set(true);
+                    None
+                })
+                .is_none()
+        );
+        assert!(
+            !asked.get(),
+            "no cache under the shape, so nothing to match against"
+        );
+    }
+
+    /// The view an execute is sent to has to outlive the name it was registered under.
+    #[test]
+    fn dropping_the_registering_name_hands_the_entry_to_the_other() {
+        let cache = QueryStatusCache::new();
+        let shape = register(&cache, "first", "SELECT v FROM t WHERE a = 1");
+        register(&cache, "second", "SELECT v FROM t WHERE a = 1");
+        cache.remove_inline_literal_cache_by_name(&Relation::from("first"));
+        let read = read_slots("SELECT v FROM t WHERE a = ?");
+        let hit = cache
+            .match_inline_literal_values(&shape, &read, || Some(vec![1.into()]))
+            .expect("the entry stands while a name claims it");
+        assert_eq!(hit.name, Relation::from("second"));
     }
 
     #[test]

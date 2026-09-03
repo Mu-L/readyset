@@ -596,7 +596,7 @@ impl<'session> SelectRouter<'session> {
 }
 
 /// Helper function to check if a query has literal LIMIT values that could be TopK candidates
-fn has_topk_literal_limit(statement: &SelectStatement) -> bool {
+pub(super) fn has_topk_literal_limit(statement: &SelectStatement) -> bool {
     statement.order.is_some()
         && statement.limit_clause.is_topk()
         && matches!(
@@ -610,33 +610,30 @@ fn has_topk_literal_limit(statement: &SelectStatement) -> bool {
 
 /// The cache keeping its author's literals inline that a finished read belongs to, if any, and
 /// that cache's parameters carrying the read's own values.
+///
+/// A position a cache holds rejects a read that binds one, so a read spelling nothing out can
+/// match nothing.
 fn inline_literal_cache_for(
     query_status_cache: &QueryStatusCache,
     shape: &ViewCreateRequest,
     read_params: &DfQueryParameters,
 ) -> Option<(ViewCreateRequest, DfQueryParameters)> {
-    if !query_status_cache.may_have_inline_literal_caches() {
+    if read_params.slots().inline_positions() == 0
+        || !query_status_cache.may_have_inline_literal_caches()
+    {
         return None;
     }
-    let matched = query_status_cache.match_inline_literal_cache(
-        &QueryId::from_select(&shape.statement, &shape.schema_search_path),
-        read_params.slots(),
-    );
-    // A miss is how a read whose literals no cache kept reaches the upstream, so from outside it
-    // is indistinguishable from the feature being broken.
-    counter!(
-        metric::INLINE_LITERAL_CACHE_LOOKUPS,
-        "result" => if matched.is_some() { "hit" } else { "miss" },
-    )
-    .increment(1);
-    // Taken from the registry as shared handles, so the copies a hit needs are made here rather
-    // than under the map's guard.
-    matched.map(|(request, cache_params, lookup)| {
-        (
-            Arc::unwrap_or_clone(request),
-            Arc::unwrap_or_clone(cache_params).for_read(read_params, lookup),
+    query_status_cache
+        .match_inline_literal_cache(
+            &QueryId::from_select(&shape.statement, &shape.schema_search_path),
+            read_params.slots(),
         )
-    })
+        .map(|(request, cache_params, lookup)| {
+            (
+                Arc::unwrap_or_clone(request),
+                Arc::unwrap_or_clone(cache_params).for_read(read_params, lookup),
+            )
+        })
 }
 
 #[cfg(test)]

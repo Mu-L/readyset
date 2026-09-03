@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::mem;
 
+use readyset_data::DfValue;
 use readyset_errors::{ReadySetError, ReadySetResult, unsupported};
 use readyset_sql::analysis::visit_mut::{self, VisitorMut};
 use readyset_sql::ast::{BinaryOperator, Expr, InValue, ItemPlaceholder, Literal, SelectStatement};
+use readyset_sql::{Dialect, TryFromDialect};
 
 use crate::rewrite_utils::{
     iter_and_conjuncts, predicate_caps_row_number, preserve_row_number_caps,
@@ -131,6 +133,56 @@ impl LiteralSlots {
             }
         }
         Some(lookup)
+    }
+
+    /// These slots with each literal converted to the value a client would bind there, which is
+    /// what a prepared statement's execute matches with.
+    pub fn to_values(&self, dialect: Dialect) -> ReadySetResult<ValueSlots> {
+        let values = self
+            .slots
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|lit| DfValue::try_from_dialect(lit, dialect))
+                    .transpose()
+            })
+            .collect::<Result<Box<[Option<DfValue>]>, _>>()?;
+        Ok(ValueSlots {
+            values,
+            in_list_runs: self.in_list_runs.clone(),
+        })
+    }
+}
+
+/// A cache's [`LiteralSlots`] as values, the form an execute's bound and spelled-out values take.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueSlots {
+    values: Box<[Option<DfValue>]>,
+    in_list_runs: Box<[(usize, usize)]>,
+}
+
+impl ValueSlots {
+    /// Match an execute holding `values` at its canonical positions against these slots, which
+    /// are a cache's; `read` is the statement's own slots, for its `IN` grouping. `Some` carries
+    /// the values at the positions the cache parameterized, in its parameter order.
+    pub fn match_values(&self, read: &LiteralSlots, values: &[DfValue]) -> Option<Vec<DfValue>> {
+        if self.in_list_runs != read.in_list_runs || self.values.len() != values.len() {
+            return None;
+        }
+        let mut parameters = Vec::new();
+        for (cached, found) in self.values.iter().zip(values) {
+            let Some(cached) = cached else {
+                parameters.push(found.clone());
+                continue;
+            };
+            let Ok(found) = found.coerce_for_comparison(&cached.infer_dataflow_type()) else {
+                return None;
+            };
+            if *cached != found {
+                return None;
+            }
+        }
+        Some(parameters)
     }
 }
 

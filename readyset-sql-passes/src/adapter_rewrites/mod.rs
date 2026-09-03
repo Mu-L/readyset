@@ -8,7 +8,9 @@ use std::fmt::Debug;
 use std::{iter, mem};
 
 pub use autoparam_exclusions::wrap_autoparam_exclusions;
-pub use autoparameterize::{AutoParameters, CacheLookupKey, LiteralSlots, auto_parameterize_query};
+pub use autoparameterize::{
+    AutoParameters, CacheLookupKey, LiteralSlots, ValueSlots, auto_parameterize_query,
+};
 use itertools::{Either, Itertools, repeat_n};
 use readyset_data::{Collation, DfType, DfValue};
 use readyset_errors::{
@@ -590,6 +592,64 @@ where
     ))
 }
 
+/// The parameters at each canonical position: `params` in canonical order, less those the
+/// adapter's own pagination consumes, with the literals autoparameterization lifted spliced in.
+fn canonical_params<'param, T>(
+    dialect: Dialect,
+    reordered_placeholders: &Option<Vec<usize>>,
+    auto_parameters: &[(usize, Literal)],
+    pagination_parameters: Option<&AdapterPaginationParams>,
+    params: &'param [T],
+) -> ReadySetResult<Cow<'param, [T]>>
+where
+    T: Clone + TryFromDialect<Literal> + Debug + Default + PartialEq,
+{
+    // Reorder parameters first (before pagination stripping)
+    let mut params = if let Some(order_map) = reordered_placeholders {
+        Cow::Owned(reorder_params(params, order_map)?)
+    } else {
+        Cow::Borrowed(params)
+    };
+
+    // When fallback pagination is used, remove the parameters for offset and limit from the end
+    // of the list
+    if let Some(AdapterPaginationParams {
+        limit_clause,
+        force_paginate_in_adapter: true,
+    }) = pagination_parameters
+    {
+        let mut end = params.len();
+        if matches!(limit_clause.offset(), Some(Literal::Placeholder(_))) {
+            end -= 1;
+        }
+        if matches!(limit_clause.limit(), Some(Literal::Placeholder(_))) {
+            end -= 1;
+        }
+        params = match params {
+            Cow::Borrowed(params) => Cow::Borrowed(&params[..end]),
+            Cow::Owned(mut params) => {
+                params.truncate(end);
+                Cow::Owned(params)
+            }
+        };
+    }
+
+    if auto_parameters.is_empty() {
+        return Ok(params);
+    }
+
+    // Convert auto_parameters literals to target type
+    let auto_parameters = auto_parameters
+        .iter()
+        .map(|(i, lit)| -> ReadySetResult<_> { Ok((*i, lit.clone().try_into_dialect(dialect)?)) })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Splice auto parameters into user-provided parameters
+    Ok(Cow::Owned(
+        splice_auto_parameters(&params, &auto_parameters).into_owned(),
+    ))
+}
+
 fn make_keys<'param, T>(
     dialect: Dialect,
     reordered_placeholders: &Option<Vec<usize>>,
@@ -601,52 +661,17 @@ fn make_keys<'param, T>(
 where
     T: Clone + TryFromDialect<Literal> + Debug + Default + PartialEq,
 {
-    // Reorder parameters first (before pagination stripping)
-    let params = if let Some(order_map) = reordered_placeholders {
-        Cow::Owned(reorder_params(params, order_map)?)
-    } else {
-        Cow::Borrowed(params)
-    };
+    let params = canonical_params(
+        dialect,
+        reordered_placeholders,
+        auto_parameters,
+        pagination_parameters,
+        params,
+    )?;
 
-    // Strip pagination params from the end if using fallback pagination
-    let params: &[T] = if let Some(pagination_parameters) = pagination_parameters {
-        let AdapterPaginationParams {
-            limit_clause,
-            force_paginate_in_adapter,
-        } = pagination_parameters;
-
-        if *force_paginate_in_adapter {
-            // When fallback pagination is used, remove the parameters for offset and limit from the
-            // list
-            let mut end = params.len();
-            if matches!(limit_clause.offset(), Some(Literal::Placeholder(_))) {
-                // Skip parameter for offset
-                end -= 1;
-            }
-            if matches!(limit_clause.limit(), Some(Literal::Placeholder(_))) {
-                // Skip parameter for limit
-                end -= 1;
-            }
-            &params[..end]
-        } else {
-            &params
-        }
-    } else {
-        &params
-    };
-
-    if params.is_empty() && auto_parameters.is_empty() {
+    if params.is_empty() {
         return Ok(vec![]);
     }
-
-    // Convert auto_parameters literals to target type
-    let auto_parameters = auto_parameters
-        .iter()
-        .map(|(i, lit)| -> ReadySetResult<_> { Ok((*i, lit.clone().try_into_dialect(dialect)?)) })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Splice auto parameters into user-provided parameters
-    let params = splice_auto_parameters(params, &auto_parameters);
 
     if let Some(rewritten_in_conditions) = rewritten_in_conditions
         && !rewritten_in_conditions.is_empty()
@@ -656,7 +681,7 @@ where
             .collect();
         Ok(params)
     } else {
-        Ok(vec![Cow::Owned(params.into_owned())])
+        Ok(vec![params])
     }
 }
 
@@ -845,6 +870,17 @@ impl DfQueryParameters {
         self
     }
 
+    /// These parameters with the limit clause taken out of the query and applied by the adapter.
+    ///
+    /// A shape that parameterizes a limit away is filed by a cache whose view holds unbounded
+    /// rows, so a read reaching one bounds them itself. Taking the clause off the statement is
+    /// what [`use_fallback_pagination`] does for a placeholder limit, and this says the same of a
+    /// literal one without walking the query again.
+    pub fn paginating_in_adapter(mut self) -> Self {
+        self.pagination_parameters.force_paginate_in_adapter = true;
+        self
+    }
+
     /// What the rewrite found at each of the query's canonical parameter positions.
     ///
     /// A cache's slots say which literals it keeps inline; a read's say what it carries. Matching
@@ -852,6 +888,39 @@ impl DfQueryParameters {
     /// [`LiteralSlots::match_read`].
     pub fn slots(&self) -> &LiteralSlots {
         &self.slots
+    }
+
+    /// The dialect the query was rewritten under.
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
+    /// What a read holds at each canonical position: the client's values in canonical order,
+    /// less any the adapter's pagination consumes, with the lifted literals spliced in.
+    pub fn canonical_values(&self, params: &[DfValue]) -> ReadySetResult<Vec<DfValue>> {
+        canonical_params(
+            self.dialect,
+            &self.reordered_placeholders,
+            &self.auto_parameters,
+            Some(&self.pagination_parameters),
+            params,
+        )
+        .map(Cow::into_owned)
+    }
+
+    /// Lookup keys from values already at this query's canonical positions, the way
+    /// [`Self::canonical_values`] lays them out.
+    pub fn make_keys_from_canonical<'v>(
+        &self,
+        values: &'v [DfValue],
+    ) -> ReadySetResult<Vec<Cow<'v, [DfValue]>>> {
+        if values.is_empty() {
+            Ok(vec![])
+        } else if self.rewritten_in_conditions.is_empty() {
+            Ok(vec![Cow::Borrowed(values)])
+        } else {
+            Ok(explode_params(values, &self.rewritten_in_conditions)?.collect())
+        }
     }
 
     /// If the query has values for OFFSET or LIMIT, get their values, returning a tuple of `limit,

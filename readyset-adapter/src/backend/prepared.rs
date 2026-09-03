@@ -22,10 +22,10 @@ use readyset_errors::ReadySetError::{self, PreparedStatementMissing};
 use readyset_errors::{ReadySetResult, internal, internal_err, unsupported, unsupported_err};
 use readyset_sql::DialectDisplay;
 use readyset_sql::ast::{
-    CacheType, DiscardObject, DiscardStatement, ReadysetHintDirective, SelectStatement,
-    SetStatement, SqlIdentifier, SqlQuery, TrxCachePolicy,
+    CacheType, DiscardObject, DiscardStatement, LimitClause, ReadysetHintDirective,
+    SelectStatement, SetStatement, SqlIdentifier, SqlQuery, TrxCachePolicy,
 };
-use readyset_sql_passes::adapter_rewrites::{self, ShallowQueryParameters};
+use readyset_sql_passes::adapter_rewrites::{self, DfQueryParameters, ShallowQueryParameters};
 use readyset_util::SizeOf;
 use readyset_util::redacted::Sensitive;
 use schema_catalog::RewriteContext;
@@ -33,13 +33,14 @@ use slab::Slab;
 use tracing::{debug, error, warn};
 
 use super::noria_connector::{self, ExecuteSelectContext, NoriaConnector, PreparedSelectTypes};
-use super::routing::{ProxyState, SelectRouter, record_skip_cache};
+use super::routing::{ProxyState, SelectRouter, has_topk_literal_limit, record_skip_cache};
 use super::{
     Backend, MigrationMode, PrepareResult, PrepareResultInner, QueryInfo, QueryResult, StatementId,
     acl_decline_reason, convert_or_parse_query, log_query, no_upstream_err, parse_query,
     parse_shallow_query,
 };
 use crate::query_handler::UpstreamSetRewrite;
+use crate::query_status_cache::InlineLiteralHit;
 use crate::session_mutation::{self, SessionMutationTemplate};
 use crate::upstream_database::UpstreamPrepare;
 use crate::{QueryHandler, UpstreamDatabase};
@@ -74,6 +75,7 @@ enum PrepareMeta {
 struct PrepareSelectMeta {
     stmt: SelectStatement,
     view_request: ViewCreateRequest,
+    inline_literal_shapes: Vec<PreparedShape>,
     query_id: Option<QueryId>,
     migration_state: MigrationState,
     must_migrate: bool,
@@ -87,6 +89,14 @@ struct PrepareShallowSelectMeta {
     stmt: ShallowViewRequest,
     params: ShallowQueryParameters,
     trx_cache_policy: TrxCachePolicy,
+}
+
+/// A shape a prepared statement takes, under which a cache keeping its author's literals inline
+/// may be filed, and the statement's own parameters for that shape.
+#[derive(Debug)]
+struct PreparedShape {
+    shape: QueryId,
+    params: DfQueryParameters,
 }
 
 /// A [`PreparedStatement`] stores the data needed for an immediate execution of a prepared
@@ -122,6 +132,8 @@ where
     /// Stored at prepare time so the execute path can emit the skip-cache
     /// metric with `reason => "hint"`.
     is_skip_cache: bool,
+    /// The shapes this statement takes, matched against caches keeping their literals inline.
+    inline_literal_shapes: Vec<PreparedShape>,
     /// Why planning declined a cache Readyset holds for this statement (the
     /// serve seams stage it while the prepare runs). Executes of the
     /// resulting upstream-only plan surface it in EXPLAIN LAST STATEMENT.
@@ -588,22 +600,61 @@ where
         let rewrite_context =
             Self::rewrite_context(&self.connectors, &self.settings, &self.state, None).await?;
         let mut rewritten = stmt.clone();
-        if let Err(e) = adapter_rewrites::rewrite_query(
+        let rewrite_params = self.connectors.noria.rewrite_params();
+        let equivalent = match adapter_rewrites::rewrite_equivalent_deep(
             &mut rewritten,
-            self.connectors.noria.rewrite_params(),
+            rewrite_params,
             &rewrite_context,
         ) {
-            warn!(
-                statement = %Sensitive(&stmt.display(self.settings.dialect)),
-                "This statement could not be rewritten for Readyset"
-            );
-            return Ok(PrepareMeta::FailedToRewrite(e));
+            Ok(params) => params,
+            Err(e) => {
+                warn!(
+                    statement = %Sensitive(&stmt.display(self.settings.dialect)),
+                    "This statement could not be rewritten for Readyset"
+                );
+                return Ok(PrepareMeta::FailedToRewrite(e));
+            }
         };
 
         if is_skip_cache {
             return Ok(PrepareMeta::Proxy);
         }
 
+        let search_path = rewrite_context.search_path();
+        let params = match adapter_rewrites::rewrite_for_readyset(
+            &mut rewritten,
+            rewrite_params,
+            equivalent,
+        ) {
+            Ok(params) => params,
+            Err(e) => {
+                warn!(
+                    statement = %Sensitive(&stmt.display(self.settings.dialect)),
+                    "This statement could not be rewritten for Readyset"
+                );
+                return Ok(PrepareMeta::FailedToRewrite(e));
+            }
+        };
+
+        // A cache keeping its literals inline is matched at execute under each shape this
+        // statement takes: its own, and for a TopK-eligible one the shape parameterizing the
+        // limit away, where a placeholder-limit cache is filed. That shape is this one without
+        // its limit clause, which the cache's view does not hold either, so the read bounds the
+        // rows itself.
+        let stripped = (rewrite_params.server_supports_topk && has_topk_literal_limit(&rewritten))
+            .then(|| {
+                let mut stripped = rewritten.clone();
+                stripped.limit_clause = LimitClause::default();
+                PreparedShape {
+                    shape: QueryId::from_select(&stripped, search_path),
+                    params: params.clone().paginating_in_adapter(),
+                }
+            });
+        let own = PreparedShape {
+            shape: QueryId::from_select(&rewritten, search_path),
+            params,
+        };
+        let inline_literal_shapes = std::iter::once(own).chain(stripped).collect();
         let view_request = ViewCreateRequest::new(
             rewritten,
             self.connectors.noria.schema_search_path().to_owned(),
@@ -623,6 +674,7 @@ where
             Ok(PrepareMeta::Select(PrepareSelectMeta {
                 stmt,
                 view_request,
+                inline_literal_shapes,
                 query_id: Some(query_id),
                 migration_state,
                 // For select statements only InRequestPath should trigger migrations
@@ -709,6 +761,7 @@ where
                 PrepareMeta::Select(PrepareSelectMeta {
                     stmt,
                     view_request,
+                    inline_literal_shapes: Vec::new(),
                     query_id: query_shallow.as_ref().map(QueryId::from),
                     migration_state: MigrationState::Unsupported("shallow-only mode".into()),
                     must_migrate: false,
@@ -842,6 +895,7 @@ where
                 trx_cache_policy: TrxCachePolicy::Never,
                 params: None,
                 is_skip_cache,
+                inline_literal_shapes: Vec::new(),
                 prepare_proxy_reason,
             },
             PrepareMeta::Set { stmt } => PreparedStatement {
@@ -855,6 +909,7 @@ where
                 trx_cache_policy: TrxCachePolicy::Never,
                 params: None,
                 is_skip_cache,
+                inline_literal_shapes: Vec::new(),
                 prepare_proxy_reason,
             },
             PrepareMeta::Discard { stmt } => PreparedStatement {
@@ -868,11 +923,13 @@ where
                 trx_cache_policy: TrxCachePolicy::Never,
                 params: None,
                 is_skip_cache,
+                inline_literal_shapes: Vec::new(),
                 prepare_proxy_reason,
             },
             PrepareMeta::Select(PrepareSelectMeta {
                 stmt,
                 view_request,
+                inline_literal_shapes,
                 query_id,
                 migration_state,
                 trx_cache_policy,
@@ -888,6 +945,7 @@ where
                 trx_cache_policy,
                 params: None,
                 is_skip_cache,
+                inline_literal_shapes,
                 prepare_proxy_reason,
             },
             PrepareMeta::ShallowSelect(PrepareShallowSelectMeta {
@@ -906,6 +964,7 @@ where
                 trx_cache_policy,
                 params: Some(params),
                 is_skip_cache,
+                inline_literal_shapes: Vec::new(),
                 prepare_proxy_reason,
             },
             PrepareMeta::Proxy
@@ -922,6 +981,7 @@ where
                 trx_cache_policy: TrxCachePolicy::Never,
                 params: None,
                 is_skip_cache,
+                inline_literal_shapes: Vec::new(),
                 prepare_proxy_reason,
             },
         }
@@ -1066,6 +1126,31 @@ where
             event.set_noria_error(e);
         }
 
+        res
+    }
+
+    /// Serve one execute from the cache its values matched. The statement stays prepared against
+    /// its own form, since its next execute may match another cache or none.
+    async fn execute_inline_literal<'a>(
+        noria: &'a mut NoriaConnector,
+        hit: &InlineLiteralHit,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        event: &mut QueryExecutionEvent,
+    ) -> ReadySetResult<QueryResult<'a, DB>> {
+        event.destination = Some(QueryDestination::Readyset(None));
+        let ctx = ExecuteSelectContext::InlineLiteral {
+            name: &hit.name,
+            params: &hit.params,
+            values: &hit.values,
+            limit,
+            offset,
+        };
+        let res = noria.execute_select(ctx, event).await.map(Into::into);
+        match &res {
+            Ok(_) => event.query_id = Some(hit.query_id),
+            Err(e) => event.set_noria_error(e),
+        }
         res
     }
 
@@ -1310,6 +1395,44 @@ where
             }
         }
 
+        // The values this execute carries choose the cache keeping its literals inline, so it is
+        // matched here; the statement's own plan stands for an execute matching none.
+        let query_status_cache = self.state.query_status_cache;
+        let inline = (!cached_statement.is_skip_cache
+            && !cached_statement.inline_literal_shapes.is_empty()
+            && query_status_cache.may_have_inline_literal_caches())
+        .then(|| {
+            cached_statement
+                .inline_literal_shapes
+                .iter()
+                .find_map(|shape| {
+                    let hit = query_status_cache.match_inline_literal_values(
+                        &shape.shape,
+                        shape.params.slots(),
+                        || shape.params.canonical_values(params).ok(),
+                    )?;
+                    // The pagination is this statement's own.
+                    let (limit, offset) = shape.params.limit_offset_params(params).ok()?;
+                    Some((hit, limit, offset))
+                })
+        })
+        .flatten()
+        .filter(|(hit, ..)| {
+            // The session's rules for bypassing a cache apply to this one as to any other.
+            let skip_reason = SelectRouter::cache_skip_reason(
+                self.state.proxy_state,
+                &mut self.state.write_tracker,
+                hit.trx_cache_policy,
+                "deep",
+                true,
+                || hit.query_id.to_string(),
+            );
+            if let Some(reason) = skip_reason {
+                self.state.pending_proxy_reason = Some(reason);
+            }
+            skip_reason.is_none()
+        });
+
         let should_fallback = {
             let policy = cached_statement.trx_cache_policy;
             // Per-execute ACL gate: a statement prepared before a revocation sees the new
@@ -1378,35 +1501,51 @@ where
         };
 
         let result = match &cached_statement.prep.inner {
-            PrepareResultInner::Noria(prep) => Self::execute_noria(noria, prep, params, &mut event)
-                .await
-                .map_err(Into::into),
+            PrepareResultInner::Noria(prep) => match inline {
+                Some((hit, limit, offset)) => {
+                    Self::execute_inline_literal(noria, &hit, limit, offset, &mut event)
+                        .await
+                        .map_err(Into::into)
+                }
+                None => Self::execute_noria(noria, prep, params, &mut event)
+                    .await
+                    .map_err(Into::into),
+            },
+            // A cache read that fails leaves the statement's own upstream plan to answer.
             PrepareResultInner::Upstream(prep) => {
-                // No inlined caches for this query exist if we are only prepared on upstream.
-                if cached_statement.migration_state.is_inlined() {
-                    self.state
-                        .query_status_cache
-                        .inlined_cache_miss(cached_statement.as_view_request()?, params.to_vec())
+                if let Some((hit, limit, offset)) = inline
+                    && let Ok(result) =
+                        Self::execute_inline_literal(noria, &hit, limit, offset, &mut event).await
+                {
+                    Ok(result)
+                } else {
+                    // No inlined caches for this query exist if we are only prepared on upstream.
+                    if cached_statement.migration_state.is_inlined() {
+                        self.state.query_status_cache.inlined_cache_miss(
+                            cached_statement.as_view_request()?,
+                            params.to_vec(),
+                        )
+                    }
+                    if cached_statement.is_skip_cache {
+                        let query_id = cached_statement
+                            .query_id
+                            .as_ref()
+                            .map(|id| id.to_string())
+                            .unwrap_or_default();
+                        record_skip_cache(query_id, "deep", "hint");
+                    }
+                    Self::execute_upstream(
+                        Self::upstream_mut(upstream)?,
+                        prep,
+                        params,
+                        exec_meta,
+                        None,
+                        &mut event,
+                        false,
+                        None,
+                    )
+                    .await
                 }
-                if cached_statement.is_skip_cache {
-                    let query_id = cached_statement
-                        .query_id
-                        .as_ref()
-                        .map(|id| id.to_string())
-                        .unwrap_or_default();
-                    record_skip_cache(query_id, "deep", "hint");
-                }
-                Self::execute_upstream(
-                    Self::upstream_mut(upstream)?,
-                    prep,
-                    params,
-                    exec_meta,
-                    None,
-                    &mut event,
-                    false,
-                    None,
-                )
-                .await
             }
             PrepareResultInner::NoriaAndUpstream(.., uprep)
             | PrepareResultInner::Shallow(uprep)
@@ -1425,23 +1564,43 @@ where
                 .await
             }
             PrepareResultInner::NoriaAndUpstream(nprep, uprep) => {
-                if cached_statement.execution_info.is_none() {
-                    cached_statement.execution_info = Some(ExecutionInfo {
-                        state: ExecutionState::Failed,
-                        last_transition_time: Instant::now(),
-                    });
+                if let Some((hit, limit, offset)) = inline {
+                    match Self::execute_inline_literal(noria, &hit, limit, offset, &mut event).await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(_) => {
+                            Self::execute_upstream(
+                                Self::upstream_mut(upstream)?,
+                                uprep,
+                                params,
+                                exec_meta,
+                                None,
+                                &mut event,
+                                true,
+                                None,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    if cached_statement.execution_info.is_none() {
+                        cached_statement.execution_info = Some(ExecutionInfo {
+                            state: ExecutionState::Failed,
+                            last_transition_time: Instant::now(),
+                        });
+                    }
+                    Self::execute_cascade(
+                        noria,
+                        Self::upstream_mut(upstream)?,
+                        nprep,
+                        uprep,
+                        params,
+                        exec_meta,
+                        cached_statement.execution_info.as_mut(),
+                        &mut event,
+                    )
+                    .await
                 }
-                Self::execute_cascade(
-                    noria,
-                    Self::upstream_mut(upstream)?,
-                    nprep,
-                    uprep,
-                    params,
-                    exec_meta,
-                    cached_statement.execution_info.as_mut(),
-                    &mut event,
-                )
-                .await
             }
             PrepareResultInner::Shallow(prep) => {
                 let query_id = cached_statement
