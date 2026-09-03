@@ -46,6 +46,9 @@ pub enum Error {
     #[error("parse error: {0}")]
     ParseError(String),
 
+    #[error("table not found: {0}")]
+    TableNotFound(String),
+
     #[error("transient error: {0}")]
     TransientError(String),
 
@@ -136,6 +139,7 @@ impl From<Error> for BackendMessage {
                 SqlState::UNDEFINED_PSTATEMENT
             }
             Error::ParseError(_) => SqlState::INVALID_PSTATEMENT_DEFINITION,
+            Error::TableNotFound(_) => SqlState::UNDEFINED_TABLE,
             Error::TransientError(_) => SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
             Error::Unimplemented(_)
             | Error::Unsupported(_)

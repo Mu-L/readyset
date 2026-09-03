@@ -42,6 +42,9 @@ impl Error {
          */
         match self {
             Self::ReadySet(e) if e.is_transient() => mysql_srv::ErrorKind::ER_QUERY_INTERRUPTED,
+            Self::ReadySet(e) if e.caused_by_table_not_found() => {
+                mysql_srv::ErrorKind::ER_NO_SUCH_TABLE
+            }
             Self::MySql(mysql_async::Error::Server(e)) => e.code.into(),
             Self::MySql(_) => {
                 // TODO(peter): We need to translate these to appropriate
