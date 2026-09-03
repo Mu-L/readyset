@@ -814,6 +814,83 @@ async fn one_prepared_statement_reaches_a_different_cache_per_bound_value() {
 
 /// Rows enough that every limit in the TopK tests is a real bound: three per status, ordered by
 /// `v`, and a `pending` row so a read that matches no cache still proves the upstream answered.
+/// A prepared statement whose cache is dropped stops being served by it, and picks it up again
+/// when an identical cache is created.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_read_follows_its_cache_being_dropped_and_recreated() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_prepared_drop", T).await;
+
+    let create = "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+                  FROM SELECT v FROM t WHERE id = ? AND status = 'active'";
+    let read = "SELECT v FROM t WHERE id = ? AND status = 'active'";
+    let served = QueryDestination::Readyset(Some("kept".into()));
+
+    rs_conn.query_drop(create).await.unwrap();
+    sleep().await;
+    let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, served.clone()).await;
+
+    // Dropping it has to take the statement upstream rather than leave it reading a gone view.
+    rs_conn.query_drop("DROP CACHE kept").await.unwrap();
+    sleep().await;
+    let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
+    assert_eq!(rows, vec![10], "still correct rows once the cache is gone");
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    // And creating it again has to be picked up.
+    rs_conn.query_drop(create).await.unwrap();
+    sleep().await;
+    let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, served).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Matching happens at execute, so a statement prepared before its cache existed reaches the
+/// cache from the next execute on, and stops when the cache is dropped.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_read_reaches_a_cache_created_after_it_prepared() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        adapter("autoparam_mode_prepared_after", T).await;
+
+    let read = "SELECT v FROM t WHERE id = ? AND status = 'active'";
+
+    // Prepared and executed while no cache exists, so the statement settles on proxying.
+    let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Same connection, same statement: the cache it now belongs to serves it.
+    let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+
+    rs_conn.query_drop("DROP CACHE kept").await.unwrap();
+    sleep().await;
+
+    let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
+    assert_eq!(rows, vec![10]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
 const TK: &str = "CREATE TABLE t (id int, status varchar(16), v int); \
                   INSERT INTO t (id, status, v) VALUES \
                   (1, 'active', 10), (2, 'active', 30), (3, 'active', 50), \
@@ -1102,6 +1179,46 @@ async fn a_prepared_literal_limit_read_reaches_a_cache_with_a_placeholder_limit(
         .await
         .unwrap();
     assert_eq!(rows, vec![70]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A statement spelling its limit out, prepared while no cache exists, settles on proxying. A
+/// placeholder-limit cache created afterwards is filed under the shape that strips the limit,
+/// which the execute has to try after the statement's own. Dropping the cache lets the
+/// statement go again.
+#[tokio::test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_prepared_literal_limit_read_picks_up_a_placeholder_limit_cache() {
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
+        topk_adapter("autoparam_topk_prepared_pickup", TK).await;
+
+    let read = "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2";
+
+    let rows: Vec<i32> = rs_conn.exec(read, ()).await.unwrap();
+    assert_eq!(rows, vec![20, 40]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE par WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?",
+        )
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Same connection, same statement: the cache it now belongs to serves it.
+    let rows: Vec<i32> = rs_conn.exec(read, ()).await.unwrap();
+    assert_eq!(rows, vec![20, 40]);
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("par".into()))).await;
+
+    rs_conn.query_drop("DROP CACHE par").await.unwrap();
+    sleep().await;
+    let rows: Vec<i32> = rs_conn.exec(read, ()).await.unwrap();
+    assert_eq!(rows, vec![20, 40]);
     assert_last_target_was(&mut rs_conn, QueryDestination::Upstream).await;
 
     shutdown_tx.shutdown().await;

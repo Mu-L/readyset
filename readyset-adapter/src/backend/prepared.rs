@@ -40,7 +40,9 @@ use super::{
     parse_shallow_query,
 };
 use crate::query_handler::UpstreamSetRewrite;
-use crate::query_status_cache::InlineLiteralHit;
+use crate::query_status_cache::{
+    InlineLiteralCandidate, InlineLiteralHit, QueryStatusCache, match_inline_literal_values,
+};
 use crate::session_mutation::{self, SessionMutationTemplate};
 use crate::upstream_database::UpstreamPrepare;
 use crate::{QueryHandler, UpstreamDatabase};
@@ -76,6 +78,7 @@ struct PrepareSelectMeta {
     stmt: SelectStatement,
     view_request: ViewCreateRequest,
     inline_literal_shapes: Vec<PreparedShape>,
+    inline_literal_caches_generation: u64,
     query_id: Option<QueryId>,
     migration_state: MigrationState,
     must_migrate: bool,
@@ -97,6 +100,8 @@ struct PrepareShallowSelectMeta {
 struct PreparedShape {
     shape: QueryId,
     params: DfQueryParameters,
+    /// The caches filed under the shape, as of the generation the statement last read them at.
+    caches: Vec<InlineLiteralCandidate>,
 }
 
 /// A [`PreparedStatement`] stores the data needed for an immediate execution of a prepared
@@ -134,6 +139,8 @@ where
     is_skip_cache: bool,
     /// The shapes this statement takes, matched against caches keeping their literals inline.
     inline_literal_shapes: Vec<PreparedShape>,
+    /// The registry generation the shapes' caches were read at.
+    inline_literal_caches_generation: u64,
     /// Why planning declined a cache Readyset holds for this statement (the
     /// serve seams stage it while the prepare runs). Executes of the
     /// resulting upstream-only plan surface it in EXPLAIN LAST STATEMENT.
@@ -144,6 +151,39 @@ impl<DB> PreparedStatement<DB>
 where
     DB: UpstreamDatabase,
 {
+    /// The cache keeping its literals inline that this execute belongs to, with the values it puts
+    /// in that cache's parameters and its own pagination.
+    ///
+    /// Each shape's caches are read at a registry generation and reread once it moves, so an
+    /// execute matches without reaching the registry and sees a cache created since.
+    fn inline_literal_hit(
+        &mut self,
+        query_status_cache: &QueryStatusCache,
+        params: &[DfValue],
+    ) -> Option<(InlineLiteralHit, Option<usize>, Option<usize>)> {
+        if self.is_skip_cache
+            || self.inline_literal_shapes.is_empty()
+            || !query_status_cache.may_have_inline_literal_caches()
+        {
+            return None;
+        }
+        let generation = query_status_cache.inline_literal_caches_generation();
+        if generation != self.inline_literal_caches_generation {
+            for shape in &mut self.inline_literal_shapes {
+                shape.caches = query_status_cache.inline_literal_caches_under(&shape.shape);
+            }
+            self.inline_literal_caches_generation = generation;
+        }
+        self.inline_literal_shapes.iter().find_map(|shape| {
+            let hit = match_inline_literal_values(&shape.caches, shape.params.slots(), || {
+                shape.params.canonical_values(params).ok()
+            })?;
+            // The pagination is this statement's own.
+            let (limit, offset) = shape.params.limit_offset_params(params).ok()?;
+            Some((hit, limit, offset))
+        })
+    }
+
     /// Returns whether we are currently in fallback recovery mode for the given prepared statement
     /// we are attempting to execute.
     /// WARNING: This will also mutate execution info timestamp if we have exceeded the supplied
@@ -648,13 +688,27 @@ where
                 PreparedShape {
                     shape: QueryId::from_select(&stripped, search_path),
                     params: params.clone().paginating_in_adapter(),
+                    caches: Vec::new(),
                 }
             });
         let own = PreparedShape {
             shape: QueryId::from_select(&rewritten, search_path),
             params,
+            caches: Vec::new(),
         };
-        let inline_literal_shapes = std::iter::once(own).chain(stripped).collect();
+        let mut inline_literal_shapes: Vec<PreparedShape> =
+            std::iter::once(own).chain(stripped).collect();
+        // Read before the shapes, so a cache registered meanwhile still reads as a change.
+        let inline_literal_caches_generation = self
+            .state
+            .query_status_cache
+            .inline_literal_caches_generation();
+        for shape in &mut inline_literal_shapes {
+            shape.caches = self
+                .state
+                .query_status_cache
+                .inline_literal_caches_under(&shape.shape);
+        }
         let view_request = ViewCreateRequest::new(
             rewritten,
             self.connectors.noria.schema_search_path().to_owned(),
@@ -675,6 +729,7 @@ where
                 stmt,
                 view_request,
                 inline_literal_shapes,
+                inline_literal_caches_generation,
                 query_id: Some(query_id),
                 migration_state,
                 // For select statements only InRequestPath should trigger migrations
@@ -762,6 +817,7 @@ where
                     stmt,
                     view_request,
                     inline_literal_shapes: Vec::new(),
+                    inline_literal_caches_generation: 0,
                     query_id: query_shallow.as_ref().map(QueryId::from),
                     migration_state: MigrationState::Unsupported("shallow-only mode".into()),
                     must_migrate: false,
@@ -896,6 +952,7 @@ where
                 params: None,
                 is_skip_cache,
                 inline_literal_shapes: Vec::new(),
+                inline_literal_caches_generation: 0,
                 prepare_proxy_reason,
             },
             PrepareMeta::Set { stmt } => PreparedStatement {
@@ -910,6 +967,7 @@ where
                 params: None,
                 is_skip_cache,
                 inline_literal_shapes: Vec::new(),
+                inline_literal_caches_generation: 0,
                 prepare_proxy_reason,
             },
             PrepareMeta::Discard { stmt } => PreparedStatement {
@@ -924,12 +982,14 @@ where
                 params: None,
                 is_skip_cache,
                 inline_literal_shapes: Vec::new(),
+                inline_literal_caches_generation: 0,
                 prepare_proxy_reason,
             },
             PrepareMeta::Select(PrepareSelectMeta {
                 stmt,
                 view_request,
                 inline_literal_shapes,
+                inline_literal_caches_generation,
                 query_id,
                 migration_state,
                 trx_cache_policy,
@@ -946,6 +1006,7 @@ where
                 params: None,
                 is_skip_cache,
                 inline_literal_shapes,
+                inline_literal_caches_generation,
                 prepare_proxy_reason,
             },
             PrepareMeta::ShallowSelect(PrepareShallowSelectMeta {
@@ -965,6 +1026,7 @@ where
                 params: Some(params),
                 is_skip_cache,
                 inline_literal_shapes: Vec::new(),
+                inline_literal_caches_generation: 0,
                 prepare_proxy_reason,
             },
             PrepareMeta::Proxy
@@ -982,6 +1044,7 @@ where
                 params: None,
                 is_skip_cache,
                 inline_literal_shapes: Vec::new(),
+                inline_literal_caches_generation: 0,
                 prepare_proxy_reason,
             },
         }
@@ -1397,41 +1460,23 @@ where
 
         // The values this execute carries choose the cache keeping its literals inline, so it is
         // matched here; the statement's own plan stands for an execute matching none.
-        let query_status_cache = self.state.query_status_cache;
-        let inline = (!cached_statement.is_skip_cache
-            && !cached_statement.inline_literal_shapes.is_empty()
-            && query_status_cache.may_have_inline_literal_caches())
-        .then(|| {
-            cached_statement
-                .inline_literal_shapes
-                .iter()
-                .find_map(|shape| {
-                    let hit = query_status_cache.match_inline_literal_values(
-                        &shape.shape,
-                        shape.params.slots(),
-                        || shape.params.canonical_values(params).ok(),
-                    )?;
-                    // The pagination is this statement's own.
-                    let (limit, offset) = shape.params.limit_offset_params(params).ok()?;
-                    Some((hit, limit, offset))
-                })
-        })
-        .flatten()
-        .filter(|(hit, ..)| {
-            // The session's rules for bypassing a cache apply to this one as to any other.
-            let skip_reason = SelectRouter::cache_skip_reason(
-                self.state.proxy_state,
-                &mut self.state.write_tracker,
-                hit.trx_cache_policy,
-                "deep",
-                true,
-                || hit.query_id.to_string(),
-            );
-            if let Some(reason) = skip_reason {
-                self.state.pending_proxy_reason = Some(reason);
-            }
-            skip_reason.is_none()
-        });
+        let inline = cached_statement
+            .inline_literal_hit(self.state.query_status_cache, params)
+            .filter(|(hit, ..)| {
+                // The session's rules for bypassing a cache apply to this one as to any other.
+                let skip_reason = SelectRouter::cache_skip_reason(
+                    self.state.proxy_state,
+                    &mut self.state.write_tracker,
+                    hit.trx_cache_policy,
+                    "deep",
+                    true,
+                    || hit.query_id.to_string(),
+                );
+                if let Some(reason) = skip_reason {
+                    self.state.pending_proxy_reason = Some(reason);
+                }
+                skip_reason.is_none()
+            });
 
         let should_fallback = {
             let policy = cached_statement.trx_cache_policy;

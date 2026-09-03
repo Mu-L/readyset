@@ -139,6 +139,30 @@ pub(crate) struct InlineLiteralCache {
     pub(crate) caches: HashSet<Relation>,
 }
 
+impl InlineLiteralCache {
+    /// What a prepared statement keeps of this cache to match its executes against.
+    fn candidate(&self) -> InlineLiteralCandidate {
+        InlineLiteralCandidate {
+            values: self.values.clone(),
+            name: self.name.clone(),
+            query_id: self.query_id,
+            trx_cache_policy: self.trx_cache_policy,
+            params: Arc::clone(&self.params),
+        }
+    }
+}
+
+/// A cache filed under one of a prepared statement's shapes, as the statement keeps it: enough to
+/// match an execute and serve it.
+#[derive(Debug, Clone)]
+pub(crate) struct InlineLiteralCandidate {
+    values: ValueSlots,
+    name: Relation,
+    query_id: QueryId,
+    trx_cache_policy: TrxCachePolicy,
+    params: Arc<DfQueryParameters>,
+}
+
 /// What serving a prepared statement's execute from a cache keeping its author's literals inline
 /// needs: the cache's view and parameters, and the values this execute puts in them.
 #[derive(Debug)]
@@ -158,6 +182,32 @@ fn record_inline_literal_lookup(hit: bool) {
         "result" => if hit { "hit" } else { "miss" },
     )
     .increment(1);
+}
+
+/// The cache among `caches`, all filed under one shape, that an execute belongs to given the
+/// values at its canonical positions, and what serving it needs. `values` is asked for only when
+/// there is a cache to match.
+pub(crate) fn match_inline_literal_values(
+    caches: &[InlineLiteralCandidate],
+    read: &LiteralSlots,
+    values: impl FnOnce() -> Option<Vec<DfValue>>,
+) -> Option<InlineLiteralHit> {
+    if caches.is_empty() {
+        return None;
+    }
+    let values = values()?;
+    let matched = caches.iter().find_map(|cache| {
+        let values = cache.values.match_values(read, &values)?;
+        Some(InlineLiteralHit {
+            name: cache.name.clone(),
+            query_id: cache.query_id,
+            trx_cache_policy: cache.trx_cache_policy,
+            params: Arc::clone(&cache.params),
+            values,
+        })
+    });
+    record_inline_literal_lookup(matched.is_some());
+    matched
 }
 
 #[derive(Debug)]
@@ -476,11 +526,23 @@ impl QueryStatusCache {
     }
 
     /// How many times the set of caches keeping literals inline has changed. A statement holding
-    /// an earlier value was planned before some of them existed, so planning it again can reach a
-    /// cache it missed.
+    /// an earlier value checked its shapes before some of them existed, so checking again can find
+    /// a cache it missed.
     pub fn inline_literal_caches_generation(&self) -> u64 {
         self.inline_literal_caches_generation
             .load(atomic::Ordering::Acquire)
+    }
+
+    /// The caches keeping their literals inline filed under `shape`, for a statement to match its
+    /// executes against until [`Self::inline_literal_caches_generation`] moves.
+    pub(crate) fn inline_literal_caches_under(
+        &self,
+        shape: &QueryId,
+    ) -> Vec<InlineLiteralCandidate> {
+        self.inline_literal_caches
+            .get(shape)
+            .map(|caches| caches.iter().map(InlineLiteralCache::candidate).collect())
+            .unwrap_or_default()
     }
 
     /// The form and parameters of the cache under `shape` that `read` belongs to, and what the
@@ -512,29 +574,14 @@ impl QueryStatusCache {
         matched
     }
 
-    /// The cache under `shape` that an execute belongs to given the values at its canonical
-    /// positions, and what serving it needs. `values` is asked for only when a cache is filed
-    /// under the shape.
+    /// [`match_inline_literal_values`] over the caches filed under `shape`.
     pub fn match_inline_literal_values(
         &self,
         shape: &QueryId,
         read: &LiteralSlots,
         values: impl FnOnce() -> Option<Vec<DfValue>>,
     ) -> Option<InlineLiteralHit> {
-        let caches = self.inline_literal_caches.get(shape)?;
-        let values = values()?;
-        let matched = caches.value().iter().find_map(|cache| {
-            let values = cache.values.match_values(read, &values)?;
-            Some(InlineLiteralHit {
-                name: cache.name.clone(),
-                query_id: cache.query_id,
-                trx_cache_policy: cache.trx_cache_policy,
-                params: Arc::clone(&cache.params),
-                values,
-            })
-        });
-        record_inline_literal_lookup(matched.is_some());
-        matched
+        match_inline_literal_values(&self.inline_literal_caches_under(shape), read, values)
     }
 
     /// Register a cache that keeps literals inline. A cache agreeing with one already registered
@@ -601,9 +648,10 @@ impl QueryStatusCache {
         }
         // `retain` can drop several entries in one pass, so count what actually went.
         let mut gone = 0;
+        let mut claimed_by_name = false;
         self.inline_literal_caches.retain(|_, caches| {
             caches.retain_mut(|cache| {
-                cache.caches.remove(name);
+                claimed_by_name |= cache.caches.remove(name);
                 // An execute is sent to a view a name still claims.
                 if cache.name == *name
                     && let Some(other) = cache.caches.iter().next()
@@ -619,6 +667,9 @@ impl QueryStatusCache {
         if gone > 0 {
             self.inline_literal_caches_live
                 .fetch_sub(gone, atomic::Ordering::Release);
+        }
+        // A statement holding the entry from before may still name the dropped view.
+        if claimed_by_name {
             self.inline_literal_caches_generation
                 .fetch_add(1, atomic::Ordering::Release);
         }
@@ -2537,13 +2588,16 @@ mod tests {
         );
     }
 
-    /// The view an execute is sent to has to outlive the name it was registered under.
+    /// The view an execute is sent to has to outlive the name it was registered under, and a
+    /// statement holding the entry from before has to learn the view it names is gone.
     #[test]
     fn dropping_the_registering_name_hands_the_entry_to_the_other() {
         let cache = QueryStatusCache::new();
         let shape = register(&cache, "first", "SELECT v FROM t WHERE a = 1");
         register(&cache, "second", "SELECT v FROM t WHERE a = 1");
+        let before = cache.inline_literal_caches_generation();
         cache.remove_inline_literal_cache_by_name(&Relation::from("first"));
+        assert_ne!(cache.inline_literal_caches_generation(), before);
         let read = read_slots("SELECT v FROM t WHERE a = ?");
         let hit = cache
             .match_inline_literal_values(&shape, &read, || Some(vec![1.into()]))
