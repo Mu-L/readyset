@@ -12,6 +12,7 @@
 use std::assert_matches;
 use std::panic::AssertUnwindSafe;
 
+use futures::{Stream, TryStreamExt};
 use readyset_client_metrics::QueryDestination;
 use readyset_client_test_helpers::{
     TestBuilder,
@@ -19,7 +20,8 @@ use readyset_client_test_helpers::{
 };
 use readyset_util::eventually;
 use test_utils::{tags, upstream};
-use tokio_postgres::Client;
+use tokio_postgres::types::ToSql;
+use tokio_postgres::{Client, GenericResult};
 
 /// A typed table whose first row is fully populated and whose second row is all
 /// NULLs, so every per-column query exercises both a value and a NULL.
@@ -77,6 +79,51 @@ async fn extended_row_bytes(conn: &Client, query: &str, id: i32) -> Vec<Vec<u8>>
         .iter()
         .map(|r| r.body().buffer().to_vec())
         .collect()
+}
+
+/// Result format code a client puts in its Bind message.
+const TEXT: i16 = 0;
+const BINARY: i16 = 1;
+
+async fn collect_row_bytes<S>(stream: S) -> Vec<Vec<u8>>
+where
+    S: Stream<Item = Result<GenericResult, tokio_postgres::Error>>,
+{
+    stream
+        .try_filter_map(|r| async move {
+            Ok(match r {
+                GenericResult::Row(row) => Some(row.body().buffer().to_vec()),
+                GenericResult::Command(..) => None,
+            })
+        })
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+/// Raw DataRow body bytes for a single-column extended-protocol query at a single key,
+/// asking for `format` in the Bind message. `named` picks between a wire-level named
+/// statement (Parse with a name, then Bind/Execute) and the unnamed statement.
+async fn formatted_row_bytes(
+    conn: &Client,
+    query: &str,
+    id: i32,
+    named: bool,
+    format: i16,
+) -> Vec<Vec<u8>> {
+    let params: Vec<&(dyn ToSql + Sync)> = vec![&id];
+    if named {
+        let stmt = conn.prepare(query).await.unwrap();
+        let stream = conn
+            .generic_query_raw(&stmt, params, [format])
+            .await
+            .unwrap();
+        collect_row_bytes(stream).await
+    } else {
+        let params = params.into_iter().map(|p| (p, tokio_postgres::types::Type::INT4));
+        let stream = conn.query_typed_raw(query, params, [format]).await.unwrap();
+        collect_row_bytes(stream).await
+    }
 }
 
 /// Debug rendering of every simple-query message. For `Row` this includes the raw `DataRowBody`
@@ -155,6 +202,110 @@ async fn postgres_shallow_extended_protocol_matches_upstream_bytes() {
                 "[{label}] shallow wire bytes diverged from upstream",
             );
         });
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// The execution that fills a shallow cache must send the client the result format it asked
+/// for in its Bind message, even though Readyset's own upstream connection asks for binary so
+/// it can decode the rows for the cache. Covers named and unnamed statements in both formats,
+/// on the filling execution and on the following hit.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn postgres_shallow_fill_honors_client_result_format() {
+    readyset_tracing::init_test_logging();
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+
+    let mut upstream_config = psql_helpers::upstream_config();
+    upstream_config.dbname("noria");
+    let upstream_conn = psql_helpers::connect(upstream_config).await;
+    upstream_conn.simple_query(CREATE_TYPED_TABLE).await.unwrap();
+
+    // Align the session time zone so timestamptz text rendering is comparable.
+    upstream_conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
+
+    for (named, format) in [(true, TEXT), (true, BINARY), (false, TEXT), (false, BINARY)] {
+        let kind = format!(
+            "{} statement, {} format",
+            if named { "named" } else { "unnamed" },
+            if format == TEXT { "text" } else { "binary" },
+        );
+
+        // Make a fresh connection per scenario, so a memoized unnamed statement from an earlier
+        // scenario is not reused.
+        let rs_conn = psql_helpers::connect(rs_opts.clone()).await;
+        rs_conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
+        for (label, projection) in COLUMN_CASES {
+            // FIXME: Readyset's text encoding of bytea lacks the `\x` prefix Postgres emits.
+            if format == TEXT && *label == "bytea" {
+                continue;
+            }
+            let query = format!("SELECT {projection} FROM shallow_wire WHERE id = $1");
+
+            let mut upstream_bodies =
+                formatted_row_bytes(&upstream_conn, &query, 1, named, format).await;
+            upstream_bodies
+                .extend(formatted_row_bytes(&upstream_conn, &query, 2, named, format).await);
+            assert_eq!(
+                upstream_bodies.len(),
+                2,
+                "[{kind}] [{label}] expected one row per key, not an empty comparison",
+            );
+
+            let create = format!("CREATE SHALLOW CACHE FROM {query}");
+            rs_conn
+                .simple_query(&create)
+                .await
+                .expect("CREATE SHALLOW CACHE should succeed");
+
+            let mut fill_bodies = formatted_row_bytes(&rs_conn, &query, 1, named, format).await;
+            let info1 = psql_helpers::last_query_info(&rs_conn).await;
+            fill_bodies.extend(formatted_row_bytes(&rs_conn, &query, 2, named, format).await);
+            let info2 = psql_helpers::last_query_info(&rs_conn).await;
+            assert_matches!(
+                &info1.destination,
+                QueryDestination::ReadysetThenUpstream(_),
+                "[{kind}] [{label}] key=1",
+            );
+            assert_matches!(
+                &info2.destination,
+                QueryDestination::ReadysetThenUpstream(_),
+                "[{kind}] [{label}] key=2",
+            );
+            assert_eq!(
+                upstream_bodies, fill_bodies,
+                "[{kind}] [{label}] shallow fill wire bytes diverged from upstream",
+            );
+
+            eventually!(run_test: {
+                let mut bodies = formatted_row_bytes(&rs_conn, &query, 1, named, format).await;
+                let info1 = psql_helpers::last_query_info(&rs_conn).await;
+                bodies.extend(formatted_row_bytes(&rs_conn, &query, 2, named, format).await);
+                let info2 = psql_helpers::last_query_info(&rs_conn).await;
+                AssertUnwindSafe(move || (info1, info2, bodies))
+            }, then_assert: |result| {
+                let (info1, info2, rs_bodies) = result();
+                assert_matches!(
+                    &info1.destination, QueryDestination::ReadysetShallow(_),
+                    "[{kind}] [{label}] key=1",
+                );
+                assert_matches!(
+                    &info2.destination, QueryDestination::ReadysetShallow(_),
+                    "[{kind}] [{label}] key=2",
+                );
+                assert_eq!(
+                    upstream_bodies, rs_bodies,
+                    "[{kind}] [{label}] shallow hit wire bytes diverged from upstream",
+                );
+            });
+        }
+        rs_conn.simple_query("DROP ALL CACHES").await.unwrap();
     }
 
     shutdown_tx.shutdown().await;

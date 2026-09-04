@@ -257,7 +257,8 @@ impl Refresh for QueryResult {
                     .iter()
                     .map(|c| c.type_().clone())
                     .collect();
-                let resultset = Resultset::from_stream(stream, first_row, field_types, Some(cache));
+                let resultset =
+                    Resultset::from_stream(stream, first_row, field_types, Some(cache), None);
                 drain_resultset(resultset).await
             }
             QueryResult::RowStream { first_row, stream } => {

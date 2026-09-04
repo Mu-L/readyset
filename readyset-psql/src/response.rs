@@ -251,15 +251,18 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     resultset: Resultset::empty(),
                 })
             }
-            Upstream(upstream::QueryResult::Stream { first_row, stream }, cache, _) => {
+            Upstream(upstream::QueryResult::Stream { first_row, stream }, cache, meta) => {
                 let field_types = first_row
                     .columns()
                     .iter()
                     .map(|c| c.type_().clone())
                     .collect();
+                let client_formats = meta.map(|m| m.to_vec());
                 Ok(ps::QueryResponse::Select {
                     schema: Default::default(), // Schema isn't necessary for upstream execute results
-                    resultset: Resultset::from_stream(stream, first_row, field_types, cache),
+                    resultset: Resultset::from_stream(
+                        stream, first_row, field_types, cache, client_formats
+                    ),
                 })
             }
             Upstream(upstream::QueryResult::RowStream { first_row, stream }, cache, meta) => {

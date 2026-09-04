@@ -111,17 +111,48 @@ impl Resultset {
         }
     }
 
+    /// Decode an upstream row into the shallow cache. Return the decoded values so the caller
+    /// can reuse them without decoding the row again.
     fn copy_row_to_cache(
         &mut self,
         row: &Option<Result<tokio_postgres::Row, psql_srv::Error>>,
-    ) -> Result<(), ps::Error> {
+    ) -> Result<Option<Vec<DfValue>>, ps::Error> {
         if let Some(Ok(row)) = row
             && let Some(cache) = &mut self.cache
         {
-            let row = row_to_df_values(row)?;
-            cache.push(CacheEntry::DfValue(row));
+            let values = row_to_df_values(row)?;
+            cache.push(CacheEntry::DfValue(values.clone()));
+            return Ok(Some(values));
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Turn an upstream row into the row we send the client. While filling a shallow cache the
+    /// upstream connection asks for binary results, so the decoded values are re-encoded into
+    /// the formats the client asked for. Otherwise upstream already used the client's formats
+    /// and the row passes through untouched.
+    fn emit_row(
+        &self,
+        row: Option<Result<tokio_postgres::Row, ps::Error>>,
+        df_values: Option<Vec<DfValue>>,
+    ) -> Option<Result<PsqlSrvRow, ps::Error>> {
+        match (row, df_values) {
+            (Some(Ok(_)), Some(df_values)) if self.client_formats.is_some() => {
+                let psql_values: Result<_, _> = df_values
+                    .into_iter()
+                    .zip(self.project_field_types.iter())
+                    .map(|(val, typ)| {
+                        TypedDfValue {
+                            value: val,
+                            col_type: typ,
+                        }
+                        .try_into()
+                    })
+                    .collect();
+                Some(psql_values.map(PsqlSrvRow::ValueVec))
+            }
+            (row, _) => row.map(|res| res.map(PsqlSrvRow::RawRow)),
+        }
     }
 
     pub fn empty() -> Self {
@@ -161,6 +192,7 @@ impl Resultset {
         first_row: tokio_postgres::Row,
         schema: Vec<Type>,
         cache: Option<CacheInsertGuard<readyset_adapter::shallow_key::ShallowKey, CacheEntry>>,
+        client_formats: Option<Vec<TransferFormat>>,
     ) -> Self {
         let names = first_row
             .columns()
@@ -175,7 +207,7 @@ impl Resultset {
             project_field_types: Arc::new(schema),
             project_field_names: names,
             cache,
-            client_formats: None,
+            client_formats,
         }
     }
 
@@ -318,31 +350,8 @@ impl Stream for Resultset {
                     },
                 };
 
-                s.copy_row_to_cache(&row)?;
-
-                if s.client_formats.is_some() && s.cache.is_some() {
-                    match row {
-                        Some(Ok(row)) => {
-                            let df_values = row_to_df_values(&row)?;
-                            let psql_values: Result<_, _> = df_values
-                                .into_iter()
-                                .zip(s.project_field_types.iter())
-                                .map(|(val, typ)| {
-                                    TypedDfValue {
-                                        value: val,
-                                        col_type: typ,
-                                    }
-                                    .try_into()
-                                })
-                                .collect();
-                            Some(Ok(PsqlSrvRow::ValueVec(psql_values?)))
-                        }
-                        Some(Err(e)) => Some(Err(e)),
-                        None => None,
-                    }
-                } else {
-                    row.map(|res| res.map(PsqlSrvRow::RawRow))
-                }
+                let df_values = s.copy_row_to_cache(&row)?;
+                s.emit_row(row, df_values)
             }
             ResultsetInner::Stream { first_row, stream } => {
                 let row = match first_row.take() {
@@ -360,8 +369,8 @@ impl Stream for Resultset {
                     },
                 };
 
-                s.copy_row_to_cache(&row)?;
-                row.map(|res| res.map(PsqlSrvRow::RawRow))
+                let df_values = s.copy_row_to_cache(&row)?;
+                s.emit_row(row, df_values)
             }
             ResultsetInner::SimpleQueryStream {
                 first_message,
