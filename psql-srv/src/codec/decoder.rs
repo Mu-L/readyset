@@ -18,7 +18,6 @@ use uuid::Uuid;
 
 use crate::bytes::BytesStr;
 use crate::codec::error::DecodeError as Error;
-use crate::codec::error::DecodeError::InvalidTextByteArrayValue;
 use crate::codec::{Codec, DecodeError};
 use crate::message::FrontendMessage::{self, *};
 use crate::message::SaslInitialResponse;
@@ -465,6 +464,45 @@ fn get_bitvec_from_str(bit_str: &str) -> Result<BitVec, Error> {
     Ok(bits)
 }
 
+/// Parse the text representation of a bytea value, accepting the same input Postgres does. Input
+/// starting with `\x` is hex, with whitespace permitted between digit pairs. Anything else is the
+/// escape format, where `\\` is a backslash, `\ooo` is an octal byte, and other bytes stand for
+/// themselves.
+fn parse_bytea_text(text: &str) -> Result<Vec<u8>, Error> {
+    let invalid = || Error::InvalidTextByteArrayValue(text.to_owned());
+    let Some(hex_str) = text.strip_prefix("\\x") else {
+        return parse_bytea_escape(text.as_bytes()).ok_or_else(invalid);
+    };
+    let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+    for chunk in hex_str.split_ascii_whitespace() {
+        bytes.extend(hex::decode(chunk).map_err(|_| invalid())?);
+    }
+    Ok(bytes)
+}
+
+fn parse_bytea_escape(mut src: &[u8]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(src.len());
+    while let Some((&b, rest)) = src.split_first() {
+        src = rest;
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match src {
+            [b'\\', rest @ ..] => {
+                bytes.push(b'\\');
+                src = rest;
+            }
+            [d1 @ b'0'..=b'3', d2 @ b'0'..=b'7', d3 @ b'0'..=b'7', rest @ ..] => {
+                bytes.push((d1 - b'0') << 6 | (d2 - b'0') << 3 | (d3 - b'0'));
+                src = rest;
+            }
+            _ => return None,
+        }
+    }
+    Some(bytes)
+}
+
 fn get_text_value(src: &mut Bytes, t: &Type) -> Result<PsqlValue, Error> {
     let len = get_i32(src)?;
     if len == LENGTH_NULL_SENTINEL {
@@ -523,10 +561,7 @@ fn get_text_value(src: &mut Bytes, t: &Type) -> Result<PsqlValue, Error> {
                     .expect("FixedOffset cannot produce ambiguous local times"),
             ))
         }
-        Type::BYTEA => {
-            let bytes = hex::decode(text_str).map_err(InvalidTextByteArrayValue)?;
-            Ok(PsqlValue::ByteArray(bytes))
-        }
+        Type::BYTEA => parse_bytea_text(text_str).map(PsqlValue::ByteArray),
         Type::MACADDR => MacAddress::parse_str(text_str)
             .map_err(DecodeError::InvalidTextMacAddressValue)
             .map(PsqlValue::MacAddress),
@@ -1567,15 +1602,48 @@ mod tests {
         );
     }
 
+    fn decode_text_bytea(text: &[u8]) -> Result<PsqlValue, Error> {
+        let mut buf = BytesMut::new();
+        buf.put_i32(text.len() as i32);
+        buf.extend_from_slice(text);
+        get_text_value(&mut buf.freeze(), &Type::BYTEA)
+    }
+
     #[test]
     fn test_decode_text_bytes() {
-        let mut buf = BytesMut::new();
-        buf.put_i32(12);
-        buf.extend_from_slice(b"0008275c6480");
+        let expected = PsqlValue::ByteArray(vec![0, 8, 39, 92, 100, 128]);
+        assert_eq!(decode_text_bytea(b"\\x0008275c6480").unwrap(), expected);
+        assert_eq!(decode_text_bytea(b"\\x0008275C6480").unwrap(), expected);
         assert_eq!(
-            get_text_value(&mut buf.freeze(), &Type::BYTEA).unwrap(),
-            PsqlValue::ByteArray(vec![0, 8, 39, 92, 100, 128])
+            decode_text_bytea(b"\\x00 08\t27\n5c\r64 80").unwrap(),
+            expected
         );
+        assert_eq!(
+            decode_text_bytea(b"\\x").unwrap(),
+            PsqlValue::ByteArray(vec![])
+        );
+        decode_text_bytea(b"\\x0 8").unwrap_err();
+        decode_text_bytea(b"\\x0g").unwrap_err();
+    }
+
+    #[test]
+    fn test_decode_text_bytes_escape_format() {
+        assert_eq!(
+            decode_text_bytea(b"abc\\000\\\\'\\377").unwrap(),
+            PsqlValue::ByteArray(vec![b'a', b'b', b'c', 0, b'\\', b'\'', 255])
+        );
+        assert_eq!(
+            decode_text_bytea(b"deadbeef").unwrap(),
+            PsqlValue::ByteArray(b"deadbeef".to_vec())
+        );
+        assert_eq!(
+            decode_text_bytea(b"").unwrap(),
+            PsqlValue::ByteArray(vec![])
+        );
+        decode_text_bytea(b"abc\\").unwrap_err();
+        decode_text_bytea(b"\\400").unwrap_err();
+        decode_text_bytea(b"\\12").unwrap_err();
+        decode_text_bytea(b"\\n").unwrap_err();
     }
 
     #[test]

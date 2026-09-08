@@ -3,7 +3,6 @@ use std::marker::{Send, Sync};
 use std::num::{ParseFloatError, ParseIntError, TryFromIntError};
 use std::str::Utf8Error;
 
-use hex::FromHexError;
 use postgres_types::Type;
 use thiserror::Error;
 
@@ -44,7 +43,7 @@ pub enum DecodeError {
     InvalidTimezoneOffset(String),
 
     #[error("invalid text byte array value: {0}")]
-    InvalidTextByteArrayValue(FromHexError),
+    InvalidTextByteArrayValue(String),
 
     #[error("invalid text mac address value: {0}")]
     InvalidTextMacAddressValue(eui48::ParseError),

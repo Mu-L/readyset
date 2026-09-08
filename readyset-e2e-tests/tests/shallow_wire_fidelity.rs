@@ -242,10 +242,6 @@ async fn postgres_shallow_fill_honors_client_result_format() {
         let rs_conn = psql_helpers::connect(rs_opts.clone()).await;
         rs_conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
         for (label, projection) in COLUMN_CASES {
-            // FIXME: Readyset's text encoding of bytea lacks the `\x` prefix Postgres emits.
-            if format == TEXT && *label == "bytea" {
-                continue;
-            }
             let query = format!("SELECT {projection} FROM shallow_wire WHERE id = $1");
 
             let mut upstream_bodies =

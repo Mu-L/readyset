@@ -678,14 +678,11 @@ fn put_text_payload(val: &PsqlValue, dst: &mut BytesMut) -> Result<(), Error> {
             v.put(dst);
         }
         PsqlValue::ByteArray(b) => {
-            write!(
-                dst,
-                "{}",
-                b.iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<Vec<String>>()
-                    .join("")
-            )?;
+            // Postgres `bytea_output = 'hex'` format.
+            dst.extend_from_slice(b"\\x");
+            let start = dst.len();
+            dst.resize(start + 2 * b.len(), 0);
+            hex::encode_to_slice(b, &mut dst[start..]).expect("output slice sized for input");
         }
         PsqlValue::MacAddress(m) => write!(dst, "{}", m.to_string(MacAddressFormat::HexString))?,
         PsqlValue::Inet(ip) => write!(dst, "{ip}")?,
@@ -1737,8 +1734,8 @@ mod tests {
         let bytes = vec![0, 8, 39, 92, 100, 128];
         put_text_value(&PsqlValue::ByteArray(bytes), &mut buf).unwrap();
         let mut exp = BytesMut::new();
-        exp.put_i32(12); // length (placeholder)
-        exp.extend_from_slice(b"0008275c6480");
+        exp.put_i32(14); // length (placeholder)
+        exp.extend_from_slice(b"\\x0008275c6480");
         assert_eq!(buf, exp);
     }
 
