@@ -481,7 +481,7 @@ where
         ReadySetResult<ViewCreateRequest>,
         ReadySetResult<ShallowViewRequest>,
         SchemaGeneration,
-        Option<super::InlineLiteralRegistration>,
+        Option<crate::query_status_cache::InlineLiteralRegistration>,
     )> {
         match inner {
             CacheInner::Statement { deep, shallow } => {
@@ -1626,6 +1626,9 @@ where
                 } else {
                     None
                 };
+                // The create paths take it; the registration below files it again after a
+                // schema change, under the name the persisted copy carries.
+                let registration_ddl = ddl_req.clone();
 
                 // Set by whichever branch builds a deep cache, so the registration below runs
                 // once for all of them.
@@ -1721,12 +1724,13 @@ where
                         .clone()
                         .unwrap_or_else(|| QueryId::from(&registration.request).into());
                     state.query_status_cache.register_inline_literal_cache(
-                        registration.shape,
-                        name,
-                        registration.slots,
-                        registration.request,
-                        registration.params,
+                        registration,
+                        name.clone(),
                         *trx_cache_policy,
+                        registration_ddl.map(|mut ddl| {
+                            ddl.cache_name = Some(name);
+                            ddl
+                        }),
                     )?;
                 }
                 created_cache

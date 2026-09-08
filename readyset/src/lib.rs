@@ -45,7 +45,7 @@ use readyset_adapter::http_router::NoriaAdapterHttpRouter;
 use readyset_adapter::migration_handler::MigrationHandler;
 use readyset_adapter::proxied_queries_reporter::ProxiedQueriesReporter;
 use readyset_adapter::query_status_cache::{
-    MigrationStyle, QscSchemaChangeAdapter, QueryStatusCache,
+    InlineLiteralRecovery, MigrationStyle, QscSchemaChangeAdapter, QueryStatusCache,
 };
 use readyset_adapter::shallow_refresh_pool::ShallowRefreshPool;
 use readyset_adapter::views_synchronizer::ViewsSynchronizer;
@@ -1413,10 +1413,22 @@ where
         ));
 
         rs_connect.in_scope(|| info!("Spawning schema catalog synchronizer task"));
+        let parsing_preset = options
+            .server_worker_options
+            .parsing_preset
+            .unwrap_or_else(ParsingPreset::for_prod);
         let (schema_catalog_synchronizer, schema_catalog) =
             SchemaCatalogSynchronizer::new(rh.clone());
-        let schema_catalog_synchronizer = schema_catalog_synchronizer
-            .with_change_handler(Arc::new(QscSchemaChangeAdapter::new(query_status_cache)));
+        let schema_catalog_synchronizer =
+            schema_catalog_synchronizer.with_change_handler(Arc::new(
+                QscSchemaChangeAdapter::new(query_status_cache).recovering_inline_literal_caches(
+                    InlineLiteralRecovery {
+                        schema_catalog: schema_catalog.clone(),
+                        parsing_preset,
+                        rewrite_params: adapter_rewrite_params,
+                    },
+                ),
+            ));
         rt.handle()
             .spawn(schema_catalog_synchronizer.run(shutdown_rx.clone()));
 
@@ -1673,11 +1685,6 @@ where
         // Create a set of readers on this adapter. This will allow servicing queries directly
         // from readers on the adapter rather than across a network hop.
         let readers: Readers = Arc::new(Mutex::new(Default::default()));
-
-        let parsing_preset = options
-            .server_worker_options
-            .parsing_preset
-            .unwrap_or_else(ParsingPreset::for_prod);
 
         let memory_limit = options.server_worker_options.memory_limit;
 

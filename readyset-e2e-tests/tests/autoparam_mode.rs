@@ -1,20 +1,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mysql_async::Conn;
+use mysql_async::params::Params;
+use mysql_async::prelude::{FromRow, Queryable};
+use readyset_adapter::backend::{MigrationMode, QueryInfo};
+use readyset_adapter::query_status_cache::{MigrationStyle, QueryStatusCache};
 use readyset_client::consensus::LocalAuthorityStore;
+use readyset_client_metrics::QueryDestination;
+use readyset_client_test_helpers::mysql_helpers::{self, MySQLAdapter};
+use readyset_client_test_helpers::{TestBuilder, sleep, wait_for_schema_generation_change};
 use readyset_server::{Authority, DurabilityMode, Handle, LocalAuthority};
 use readyset_sql_parsing::ParsingPreset;
 use readyset_util::eventually;
-use tempfile::TempDir;
-use mysql_async::params::Params;
-use mysql_async::Conn;
-use mysql_async::prelude::{FromRow, Queryable};
-use readyset_adapter::query_status_cache::MigrationStyle;
-use readyset_adapter::backend::{MigrationMode, QueryInfo};
-use readyset_client_metrics::QueryDestination;
-use readyset_client_test_helpers::mysql_helpers::{self, MySQLAdapter};
-use readyset_client_test_helpers::{TestBuilder, sleep};
 use readyset_util::shutdown::ShutdownSender;
+use tempfile::TempDir;
 use test_utils::{tags, upstream};
 
 /// Run `query` until the adapter reports it served by `expected`, then hand back its rows.
@@ -244,8 +244,7 @@ async fn a_kept_literal_cache_is_reachable_under_deep_then_shallow() {
 #[tags(serial)]
 #[upstream(mysql)]
 async fn a_kept_in_list_is_lowered_as_a_filter() {
-    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
-        adapter("autoparam_mode_kept_in", T).await;
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) = adapter("autoparam_mode_kept_in", T).await;
 
     rs_conn
         .query_drop(
@@ -319,7 +318,9 @@ async fn auto_creation_mints_one_cache_for_every_literal() {
 
     for status in ["archived", "pending", "deleted"] {
         let _: Vec<i32> = rs_conn
-            .query(format!("SELECT v FROM t WHERE id = 1 AND status = '{status}'"))
+            .query(format!(
+                "SELECT v FROM t WHERE id = 1 AND status = '{status}'"
+            ))
             .await
             .unwrap();
     }
@@ -422,7 +423,6 @@ async fn a_cache_naming_no_option_parameterizes_every_literal() {
     // The literal the author spelled out became a parameter, so the cache serves other values
     // of it too.
     for (status, expected) in [("active", vec![10]), ("archived", vec![20])] {
-
         let result: Vec<i32> = eventually_readyset(
             &mut rs_conn,
             format!("SELECT v FROM t WHERE id = 1 AND status = '{status}'"),
@@ -588,8 +588,7 @@ async fn an_exclusion_scope_is_refused() {
 #[tags(serial)]
 #[upstream(mysql)]
 async fn show_caches_names_a_cache_that_keeps_its_literals() {
-    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
-        adapter("autoparam_show_caches", T).await;
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) = adapter("autoparam_show_caches", T).await;
 
     rs_conn
         .query_drop(
@@ -694,8 +693,7 @@ async fn keeping_literals_from_a_query_id_is_refused() {
 #[tags(serial)]
 #[upstream(mysql)]
 async fn a_placeholder_in_a_nested_statement_is_refused() {
-    let (mut rs_conn, _upstream, _handle, shutdown_tx) =
-        adapter("autoparam_mode_nested", T).await;
+    let (mut rs_conn, _upstream, _handle, shutdown_tx) = adapter("autoparam_mode_nested", T).await;
 
     let refused = rs_conn
         .query_drop(
@@ -765,7 +763,11 @@ async fn a_prepared_read_reaches_a_per_cache_off_cache() {
         .await
         .unwrap();
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+    assert_last_target_was(
+        &mut rs_conn,
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
 
     shutdown_tx.shutdown().await;
 }
@@ -851,7 +853,11 @@ async fn a_prepared_read_binding_a_kept_position_is_matched_by_its_value() {
     let read = "SELECT v FROM t WHERE id = ? AND status = ?";
     let rows: Vec<i32> = rs_conn.exec(read, (1, "active")).await.unwrap();
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+    assert_last_target_was(
+        &mut rs_conn,
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
 
     let rows: Vec<i32> = rs_conn.exec(read, (1, "archived")).await.unwrap();
     assert_eq!(rows, vec![20]);
@@ -963,7 +969,11 @@ async fn a_prepared_read_reaches_a_cache_created_after_it_prepared() {
     // Same connection, same statement: the cache it now belongs to serves it.
     let rows: Vec<i32> = rs_conn.exec(read, (1,)).await.unwrap();
     assert_eq!(rows, vec![10]);
-    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("kept".into()))).await;
+    assert_last_target_was(
+        &mut rs_conn,
+        QueryDestination::Readyset(Some("kept".into())),
+    )
+    .await;
 
     rs_conn.query_drop("DROP CACHE kept").await.unwrap();
     sleep().await;
@@ -1076,6 +1086,146 @@ async fn a_kept_literal_cache_survives_a_restart() {
         assert_eq!(rows, vec![10]);
         assert_eq!(destination, QueryDestination::Readyset(Some("kept".into())));
     });
+    shutdown_tx.shutdown().await;
+}
+
+/// A cache the server drops leaves nothing for a read to reach, so it falls to the upstream. The
+/// entry may be filed again -- the rewrite reads no column -- but the cache's own status is gone,
+/// which is what keeps the read off it.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_dropped_cache_takes_its_reads_upstream() {
+    readyset_tracing::init_test_logging();
+    let db_name = "autoparam_mode_dropped_cache";
+    mysql_helpers::recreate_database(db_name).await;
+
+    let query_status_cache: &'static QueryStatusCache = Box::leak(Box::new(
+        QueryStatusCache::new().style(MigrationStyle::Explicit),
+    ));
+    let (rs_opts, mut handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .migration_style(MigrationStyle::Explicit)
+        .query_status_cache(query_status_cache)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+    upstream_conn.query_drop(T).await.unwrap();
+    sleep().await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE gone WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    let read = "SELECT v FROM t WHERE id = 1 AND status = 'active'";
+    let rows: Vec<i32> = eventually_readyset(
+        &mut rs_conn,
+        read,
+        QueryDestination::Readyset(Some("gone".into())),
+    )
+    .await;
+    assert_eq!(rows, vec![10]);
+    assert!(query_status_cache.may_have_inline_literal_caches());
+
+    let generation = handle.schema_catalog().await.unwrap().generation;
+    upstream_conn
+        .query_drop("ALTER TABLE t DROP COLUMN status")
+        .await
+        .unwrap();
+    wait_for_schema_generation_change(&mut handle, generation).await;
+
+    // The entry goes with the column and nothing files it again.
+    // The server dropped the cache with the column.
+    eventually!(run_test: {
+        let caches: Vec<mysql_async::Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+        caches.len()
+    }, then_assert: |len| assert_eq!(len, 0));
+
+    // So the read is answered by the upstream, as it would be for any dropped cache.
+    let read_after = "SELECT v FROM t WHERE id = 1";
+    eventually!(run_test: {
+        let rows: Vec<i32> = rs_conn.query(read_after).await.unwrap();
+        (rows, last_target(&mut rs_conn).await.0)
+    }, then_assert: |(rows, destination)| {
+        assert_eq!(rows, vec![10, 20, 40]);
+        assert_eq!(destination, QueryDestination::Upstream);
+    });
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn a_kept_literal_cache_survives_a_schema_change_that_keeps_it() {
+    readyset_tracing::init_test_logging();
+    let db_name = "autoparam_mode_schema_change";
+    mysql_helpers::recreate_database(db_name).await;
+
+    let query_status_cache: &'static QueryStatusCache = Box::leak(Box::new(
+        QueryStatusCache::new().style(MigrationStyle::Explicit),
+    ));
+    let (rs_opts, mut handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .migration_mode(MigrationMode::OutOfBand)
+        .migration_style(MigrationStyle::Explicit)
+        .query_status_cache(query_status_cache)
+        .fallback(true)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+    upstream_conn.query_drop(T).await.unwrap();
+    sleep().await;
+
+    rs_conn
+        .query_drop(
+            "CREATE CACHE kept WITH (AUTOPARAM OFF) \
+             FROM SELECT v FROM t WHERE id = ? AND status = 'active'",
+        )
+        .await
+        .unwrap();
+    let read = "SELECT v FROM t WHERE id = 1 AND status = 'active'";
+    let served = QueryDestination::Readyset(Some("kept".into()));
+    let rows: Vec<i32> = eventually_readyset(&mut rs_conn, read, served.clone()).await;
+    assert_eq!(rows, vec![10]);
+
+    let filed = query_status_cache.inline_literal_caches_generation();
+    let generation = handle.schema_catalog().await.unwrap().generation;
+    upstream_conn
+        .query_drop("ALTER TABLE t ADD INDEX status_idx (status)")
+        .await
+        .unwrap();
+    wait_for_schema_generation_change(&mut handle, generation).await;
+    eventually! {
+        query_status_cache.inline_literal_caches_generation() > filed
+    }
+    eventually!(
+        message: "the kept cache should be filed again after the schema change".to_string(),
+        { query_status_cache.may_have_inline_literal_caches() }
+    );
+
+    // The server kept the cache, so the read has to reach it again.
+    let caches: Vec<mysql_async::Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+    assert_eq!(caches.len(), 1, "an added index drops no cache");
+    eventually!(run_test: {
+        let rows: Vec<i32> = rs_conn.query(read).await.unwrap();
+        (rows, last_target(&mut rs_conn).await.0)
+    }, then_assert: |(rows, destination)| {
+        assert_eq!(rows, vec![10]);
+        assert_eq!(destination, served);
+    });
+
     shutdown_tx.shutdown().await;
 }
 
@@ -1295,7 +1445,10 @@ async fn an_orderless_limit_read_takes_one_shape() {
     )
     .await;
     assert_eq!(rows.len(), 1);
-    assert!([20, 40, 60].contains(&rows[0]), "an archived row, from upstream: {rows:?}");
+    assert!(
+        [20, 40, 60].contains(&rows[0]),
+        "an archived row, from upstream: {rows:?}"
+    );
 
     shutdown_tx.shutdown().await;
 }
@@ -1319,14 +1472,20 @@ async fn a_prepared_topk_read_reaches_the_cache_that_kept_its_limit() {
     sleep().await;
 
     let rows: Vec<i32> = rs_conn
-        .exec("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2", ())
+        .exec(
+            "SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 2",
+            (),
+        )
         .await
         .unwrap();
     assert_eq!(rows, vec![10, 30]);
     assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lit".into()))).await;
 
     let rows: Vec<i32> = rs_conn
-        .exec("SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 1", ())
+        .exec(
+            "SELECT v FROM t WHERE status = 'active' ORDER BY v LIMIT 1",
+            (),
+        )
         .await
         .unwrap();
     assert_eq!(rows, vec![10]);
@@ -1358,14 +1517,20 @@ async fn a_prepared_literal_limit_read_reaches_a_cache_with_a_placeholder_limit(
     let served = QueryDestination::Readyset(Some("par".into()));
 
     let rows: Vec<i32> = rs_conn
-        .exec("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?", (1,))
+        .exec(
+            "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT ?",
+            (1,),
+        )
         .await
         .unwrap();
     assert_eq!(rows, vec![20]);
     assert_last_target_was(&mut rs_conn, served.clone()).await;
 
     let rows: Vec<i32> = rs_conn
-        .exec("SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2", ())
+        .exec(
+            "SELECT v FROM t WHERE status = 'archived' ORDER BY v LIMIT 2",
+            (),
+        )
         .await
         .unwrap();
     assert_eq!(rows, vec![20, 40]);
@@ -1373,7 +1538,10 @@ async fn a_prepared_literal_limit_read_reaches_a_cache_with_a_placeholder_limit(
 
     // A literal the cache did not keep matches nothing on either attempt.
     let rows: Vec<i32> = rs_conn
-        .exec("SELECT v FROM t WHERE status = 'pending' ORDER BY v LIMIT 1", ())
+        .exec(
+            "SELECT v FROM t WHERE status = 'pending' ORDER BY v LIMIT 1",
+            (),
+        )
         .await
         .unwrap();
     assert_eq!(rows, vec![70]);

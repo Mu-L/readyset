@@ -19,7 +19,7 @@ use readyset_adapter::cache_acl::{AclHandle, AclMatrix, ACL_QUEUE_CAPACITY};
 use readyset_adapter::cache_acl_worker::AclWorker;
 use readyset_adapter::cache_grants_vrel::AclCacheGrants;
 use readyset_adapter::query_status_cache::{
-    MigrationStyle, QscSchemaChangeAdapter, QueryStatusCache,
+    InlineLiteralRecovery, MigrationStyle, QscSchemaChangeAdapter, QueryStatusCache,
 };
 use readyset_adapter::rls_coordinator::RlsCoordinator;
 use readyset_adapter::shallow_refresh_pool::ShallowRefreshPool;
@@ -609,10 +609,19 @@ impl TestBuilder {
             ))
         });
 
+        let rewrite_params = handle.adapter_rewrite_params().await.unwrap();
         let (schema_catalog_synchronizer, schema_catalog) =
             SchemaCatalogSynchronizer::new(handle.clone());
-        let schema_catalog_synchronizer = schema_catalog_synchronizer
-            .with_change_handler(Arc::new(QscSchemaChangeAdapter::new(query_status_cache)));
+        let schema_catalog_synchronizer =
+            schema_catalog_synchronizer.with_change_handler(Arc::new(
+                QscSchemaChangeAdapter::new(query_status_cache).recovering_inline_literal_caches(
+                    InlineLiteralRecovery {
+                        schema_catalog: schema_catalog.clone(),
+                        parsing_preset: self.parsing_preset,
+                        rewrite_params,
+                    },
+                ),
+            ));
         tokio::spawn(schema_catalog_synchronizer.run(shutdown_tx.subscribe()));
         // Give the synchronizer a chance to subscribe to controller events before tests start
         // issuing DDL/DML against the upstream, otherwise early schema updates can be missed.
@@ -662,8 +671,6 @@ impl TestBuilder {
         let shallow = Arc::new(shallow);
 
         // Replay any persisted shallow caches, mirroring the production adapter startup.
-        let mut rh = ReadySetHandle::new(authority.clone()).await;
-        let rewrite_params = rh.adapter_rewrite_params().await.unwrap();
         let shallow_ddl = authority
             .shallow_cache_ddl_requests()
             .await

@@ -113,8 +113,7 @@ use readyset_sql::ast::{
 use readyset_sql::{Dialect, DialectDisplay, TryFromDialect};
 use readyset_sql_parsing::ParsingPreset;
 use readyset_sql_passes::adapter_rewrites::{
-    self, AdapterRewriteContext, AdapterRewriteParams, DfQueryParameters, LiteralSlots,
-    ShallowQueryParameters,
+    self, AdapterRewriteContext, AdapterRewriteParams, ShallowQueryParameters,
 };
 use readyset_sql_passes::detect_references::{references_schema, references_variables};
 use readyset_sql_passes::shallow::{
@@ -132,7 +131,7 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::query_status_cache::QueryStatusCache;
+use crate::query_status_cache::{InlineLiteralRegistration, QueryStatusCache};
 use crate::status_reporter::ReadySetStatusReporter;
 pub use crate::upstream_database::UpstreamPrepare;
 use crate::utils::{create_dummy_column, time_or_null};
@@ -2413,23 +2412,6 @@ enum RecoveryOutcome {
     Skipped { reason: String },
 }
 
-/// A cache that keeps its author's literals inline, and what a read needs to reach it.
-///
-/// Such a cache takes a form no read produces on its own, so it is filed under the shape a read
-/// does hash to, and a read that carries the literals in [`Self::slots`] is served from the form
-/// and parameters here.
-#[derive(Debug)]
-pub(crate) struct InlineLiteralRegistration {
-    /// The canonical shape a read hashes to.
-    pub shape: QueryId,
-    /// What the cache holds at each of that shape's parameter positions.
-    pub slots: LiteralSlots,
-    /// The cache's own form.
-    pub request: ViewCreateRequest,
-    /// Its parameters, whose values a matching read replaces with its own.
-    pub params: DfQueryParameters,
-}
-
 /// The form a cache takes, and the registration it owes the read path when it keeps its author's
 /// literals inline.
 ///
@@ -2528,15 +2510,9 @@ pub async fn recreate_inline_literal_caches(
             "recovered caches that keep their literals inline"
         );
     }
-    if !deferred.is_empty() {
-        tokio::spawn(retry_deferred_inline_literal_caches(
-            query_status_cache,
-            schema_handle,
-            deferred,
-            parsing_preset,
-            rewrite_params,
-        ));
-    }
+    // A statement naming a relation the catalog has not caught up to is kept for the next
+    // catalog change, which is what a snapshot still filling in produces.
+    query_status_cache.defer_inline_literal_caches(deferred);
     Ok(())
 }
 
@@ -2599,66 +2575,12 @@ fn recover_inline_literal_cache(
         .or_else(|| req.cache_name.clone())
         .unwrap_or_else(|| QueryId::from(&registration.request).into());
     query_status_cache.register_inline_literal_cache(
-        registration.shape,
+        registration,
         name,
-        registration.slots,
-        registration.request,
-        registration.params,
         create.trx_cache_policy,
+        Some(req.clone()),
     )?;
     Ok(true)
-}
-
-/// Retry the caches that could not be recovered at startup, on the schedule deferred shallow
-/// caches use.
-async fn retry_deferred_inline_literal_caches(
-    query_status_cache: &'static QueryStatusCache,
-    schema_handle: SchemaCatalogHandle,
-    mut pending: Vec<CacheDDLRequest>,
-    parsing_preset: ParsingPreset,
-    rewrite_params: AdapterRewriteParams,
-) {
-    for _ in 1..=RECOVERY_RETRY_MAX_ATTEMPTS {
-        tokio::time::sleep(RECOVERY_RETRY_INTERVAL).await;
-        if pending.is_empty() {
-            return;
-        }
-        let Ok(catalog) = schema_handle.get_catalog_retrying().await else {
-            continue;
-        };
-        // Rewriting is as heavy here as it is at startup, so it stays off the reactor too.
-        let batch = std::mem::take(&mut pending);
-        pending = match tokio::task::spawn_blocking(move || {
-            let mut still_pending = Vec::new();
-            for req in batch {
-                if let Err(error) = recover_inline_literal_cache(
-                    query_status_cache,
-                    parsing_preset,
-                    rewrite_params,
-                    &catalog,
-                    &req,
-                ) {
-                    debug!(%error, statement = %Sensitive(&req.unparsed_stmt), "cache still deferred");
-                    still_pending.push(req);
-                }
-            }
-            still_pending
-        })
-        .await
-        {
-            Ok(still_pending) => still_pending,
-            Err(error) => {
-                warn!(%error, "recovering inline-literal caches panicked; giving up the retry");
-                return;
-            }
-        };
-    }
-    for req in &pending {
-        warn!(
-            statement = %Sensitive(&req.unparsed_stmt),
-            "gave up recovering a cache; its ad-hoc reads go upstream until a restart"
-        );
-    }
 }
 
 /// Recreate shallow caches from stored DDL requests on adapter
