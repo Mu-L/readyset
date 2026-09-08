@@ -230,6 +230,9 @@ async fn postgres_shallow_fill_honors_client_result_format() {
     // Align the session time zone so timestamptz text rendering is comparable.
     upstream_conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
 
+    let rs_conn = psql_helpers::connect(rs_opts).await;
+    rs_conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
+
     for (named, format) in [(true, TEXT), (true, BINARY), (false, TEXT), (false, BINARY)] {
         let kind = format!(
             "{} statement, {} format",
@@ -237,10 +240,6 @@ async fn postgres_shallow_fill_honors_client_result_format() {
             if format == TEXT { "text" } else { "binary" },
         );
 
-        // Make a fresh connection per scenario, so a memoized unnamed statement from an earlier
-        // scenario is not reused.
-        let rs_conn = psql_helpers::connect(rs_opts.clone()).await;
-        rs_conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
         for (label, projection) in COLUMN_CASES {
             let query = format!("SELECT {projection} FROM shallow_wire WHERE id = $1");
 

@@ -2396,6 +2396,127 @@ async fn skip_cache_hint_bypasses_shallow_cache_prepared() {
     shutdown_tx.shutdown().await;
 }
 
+/// Fill and then hit the shallow cache through the prepared statement `stmt`.
+async fn assert_prepared_fills_then_hits(
+    readyset: &mut mysql_async::Conn,
+    stmt: &mysql_async::Statement,
+    stage: &str,
+) {
+    let val: i32 = readyset.exec_first(stmt, (1,)).await.unwrap().unwrap();
+    assert_eq!(val, 100, "{stage}: fill row");
+    assert_matches!(
+        last_query_info(readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+        "{stage}: fill destination"
+    );
+    let val: i32 = readyset.exec_first(stmt, (1,)).await.unwrap().unwrap();
+    assert_eq!(val, 100, "{stage}: hit row");
+    assert_matches!(
+        last_query_info(readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "{stage}: hit destination"
+    );
+}
+
+/// REA-6961: a prepared statement planned against a shallow cache proxies upstream after the
+/// cache is dropped. Once the cache is re-created, the statement is served from it again.
+async fn shallow_prepared_statement_survives_drop(create: &str, drop: &str, other_conn: bool) {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE t (id INT, val INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO t VALUES (1, 100)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+    let mut dropper = if other_conn {
+        let mut conn = mysql_async::Conn::new(readyset_opts).await.unwrap();
+        conn.query_drop(format!("USE {test_name}")).await.unwrap();
+        Some(conn)
+    } else {
+        None
+    };
+
+    readyset.query_drop(create).await.unwrap();
+
+    // Hold the statement handle so the executes reuse the same server-side statement.
+    let stmt = readyset.prep("SELECT val FROM t WHERE id = ?").await.unwrap();
+    assert_prepared_fills_then_hits(&mut readyset, &stmt, "initial cache").await;
+
+    dropper
+        .as_mut()
+        .unwrap_or(&mut readyset)
+        .query_drop(drop)
+        .await
+        .unwrap();
+    let val: i32 = readyset.exec_first(&stmt, (1,)).await.unwrap().unwrap();
+    assert_eq!(val, 100, "row after drop");
+    assert_eq!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::Upstream,
+        "a prepared shallow plan whose cache is gone must proxy upstream"
+    );
+
+    readyset.query_drop(create).await.unwrap();
+    assert_prepared_fills_then_hits(&mut readyset, &stmt, "re-created cache").await;
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_prepared_statement_survives_drop_all_caches() {
+    shallow_prepared_statement_survives_drop(
+        "CREATE SHALLOW CACHE FROM SELECT val FROM t WHERE id = ?",
+        "DROP ALL CACHES",
+        false,
+    )
+    .await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_prepared_statement_survives_drop_cache_by_name() {
+    shallow_prepared_statement_survives_drop(
+        "CREATE SHALLOW CACHE by_id FROM SELECT val FROM t WHERE id = ?",
+        "DROP CACHE by_id",
+        false,
+    )
+    .await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_prepared_statement_survives_drop_from_other_connection() {
+    shallow_prepared_statement_survives_drop(
+        "CREATE SHALLOW CACHE by_id FROM SELECT val FROM t WHERE id = ?",
+        "DROP CACHE by_id",
+        true,
+    )
+    .await;
+}
+
 // --- PostgreSQL hint e2e tests ---
 //
 // These mirror the MySQL hint e2e tests above, exercising the

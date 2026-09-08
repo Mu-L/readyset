@@ -1122,7 +1122,7 @@ where
         self.prepared.invalidate(view_request);
     }
 
-    fn drop_shallow_view_request(&self, shallow: &ShallowViewRequest) {
+    fn drop_shallow_view_request(&mut self, shallow: &ShallowViewRequest) {
         self.query_status_cache.update_query_migration_state(
             shallow,
             MigrationState::Pending,
@@ -1130,10 +1130,11 @@ where
         );
         self.query_status_cache
             .set_trx_cache_policy(shallow, TrxCachePolicy::Never);
+        self.prepared.invalidate_shallow(QueryId::from(shallow));
     }
 
     async fn drop_shallow_cached_query(
-        &self,
+        &mut self,
         name: Option<&Relation>,
         query_id: Option<QueryId>,
     ) -> ReadySetResult<()> {

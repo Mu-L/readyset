@@ -384,7 +384,9 @@ where
                 };
                 Self::query_fallback(connectors.upstream.as_mut(), query, event, Some(cache)).await
             }
-            CacheResult::NotCached => Err(ReadySetError::NoCacheForQuery.into()),
+            CacheResult::NotCached => {
+                Self::query_fallback(connectors.upstream.as_mut(), query, event, None).await
+            }
         }
     }
 
@@ -403,6 +405,7 @@ where
         refresh: Option<&Arc<ShallowRefreshPool<DB>>>,
         view_request: &ShallowViewRequest,
         results_encoding: Encoding,
+        migration_state: &mut MigrationState,
     ) -> Result<QueryResult<'a, DB>, DB::Error> {
         let merged = query_params.merge_params(params)?.unwrap_or_default();
         let params_key = query_params.make_keys_from_merged(&merged)?;
@@ -522,7 +525,11 @@ where
                 )
                 .await
             }
-            CacheResult::NotCached => Err(ReadySetError::NoCacheForQuery.into()),
+            CacheResult::NotCached => {
+                *migration_state = MigrationState::Pending;
+                Self::execute_upstream(upstream, prep, params, exec_meta, None, event, false, None)
+                    .await
+            }
         }
     }
 

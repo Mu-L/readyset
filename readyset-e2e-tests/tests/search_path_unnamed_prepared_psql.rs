@@ -8,6 +8,8 @@
 //! - REA-6746: an unnamed slot first Parsed inside a transaction memoizes an
 //!   upstream-only plan; after COMMIT/ROLLBACK, re-Parsing must recover caching
 //!   rather than stay pinned to the transaction-bypassed plan.
+//! - REA-6961: a memoized shallow plan must keep executing after its cache is
+//!   dropped, proxying upstream until the cache is re-created.
 //!
 //! `tokio_postgres` always names its prepared statements, which take a different
 //! code path, so these reproduce the extended-protocol unnamed slot with a raw
@@ -346,4 +348,81 @@ async fn unnamed_prepared_recovers_cache_after_transaction() {
     }
 
     shutdown_tx.shutdown().await;
+}
+
+/// Fill and then hit the shallow cache for `query` through the memoized unnamed statement.
+async fn assert_unnamed_fills_then_hits(conn: &mut RawPgConn, query: &str, stage: &str) {
+    let rows = conn.unnamed_query(query, "1").await;
+    assert_eq!(rows, vec!["one"], "{stage}: fill rows");
+    assert_matches!(
+        conn.last_query_destination().await,
+        QueryDestination::ReadysetThenUpstream(_),
+        "{stage}: fill destination",
+    );
+    let rows = conn.unnamed_query(query, "1").await;
+    assert_eq!(rows, vec!["one"], "{stage}: hit rows");
+    assert_matches!(
+        conn.last_query_destination().await,
+        QueryDestination::ReadysetShallow(_),
+        "{stage}: hit destination",
+    );
+}
+
+/// REA-6961: an unnamed statement planned against a shallow cache stays memoized after
+/// `drop` removes that cache. Executing it must proxy upstream while the cache is gone, and
+/// pick the cache back up once `create` re-creates it under the same query id.
+async fn unnamed_prepared_shallow_survives_drop(create: &str, drop: &str) {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    seed_upstream(
+        &test_name,
+        &[
+            "CREATE TABLE t (id integer PRIMARY KEY, c text NOT NULL)",
+            "INSERT INTO t (id, c) VALUES (1, 'one')",
+        ],
+    )
+    .await;
+
+    let (mut conn, _handle, shutdown_tx) = connect_backend(&test_name).await;
+
+    let query = "SELECT c FROM t WHERE id = $1";
+    conn.simple_query(create).await;
+    assert_unnamed_fills_then_hits(&mut conn, query, "initial cache").await;
+
+    conn.simple_query(drop).await;
+    let rows = conn.unnamed_query(query, "1").await;
+    assert_eq!(rows, vec!["one"], "rows after drop");
+    assert_eq!(
+        conn.last_query_destination().await,
+        QueryDestination::Upstream,
+        "a memoized shallow plan whose cache is gone must proxy upstream",
+    );
+
+    conn.simple_query(create).await;
+    assert_unnamed_fills_then_hits(&mut conn, query, "re-created cache").await;
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn unnamed_prepared_shallow_survives_drop_all_caches() {
+    unnamed_prepared_shallow_survives_drop(
+        "CREATE SHALLOW CACHE FROM SELECT c FROM t WHERE id = $1",
+        "DROP ALL CACHES",
+    )
+    .await;
+}
+
+#[test]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn unnamed_prepared_shallow_survives_drop_cache_by_name() {
+    unnamed_prepared_shallow_survives_drop(
+        "CREATE SHALLOW CACHE by_id FROM SELECT c FROM t WHERE id = $1",
+        "DROP CACHE by_id",
+    )
+    .await;
 }

@@ -215,12 +215,6 @@ where
             .as_ref()
             .ok_or_else(|| internal_err!("Expected ViewRequest for CachedPreparedStatement"))
     }
-
-    fn as_shallow(&self) -> ReadySetResult<&ShallowViewRequest> {
-        self.shallow
-            .as_ref()
-            .ok_or_else(|| internal_err!("Missing shallow query"))
-    }
 }
 
 /// The prepared statements of one connection, keyed by statement id.
@@ -338,8 +332,9 @@ where
         }
     }
 
-    /// Forces every statement upstream, marking those backed by a cache of `cache_type` (or any
-    /// type, when `None`) as pending. Used when caches are dropped wholesale.
+    /// Force the statements upstream after a `DROP ALL CACHES`. A statement backed by a cache of
+    /// `cache_type` (or of any type, when `None`) becomes pending so a later execute can pick up
+    /// a re-created cache.
     pub(super) fn invalidate_all(&mut self, cache_type: Option<CacheType>) {
         self.statements.iter_mut().for_each(
             |(
@@ -358,6 +353,18 @@ where
                 prep.make_upstream_only();
             },
         );
+    }
+
+    /// Mark the statements backed by the shallow cache for `query_id` as pending. They proxy
+    /// upstream until the cache is re-created.
+    pub(super) fn invalidate_shallow(&mut self, query_id: QueryId) {
+        for (_, stmt) in self.statements.iter_mut() {
+            if stmt.migration_state == MigrationState::Successful(CacheType::Shallow)
+                && stmt.query_id == Some(query_id)
+            {
+                stmt.migration_state = MigrationState::Pending;
+            }
+        }
     }
 
     /// Marks every statement backed by `stmt` as pending and forces it upstream, so a dropped
@@ -1392,6 +1399,16 @@ where
         // If the query is inlined, we have to check the epoch of the current state in the query
         // status cache to see if we should prepare the statement again.
         if cached_statement.migration_state.is_pending()
+            && let Some(shallow) = cached_statement.shallow.as_ref()
+        {
+            if let (_, Some(MigrationState::Successful(CacheType::Shallow))) = self
+                .state
+                .query_status_cache
+                .try_query_migration_state(shallow)
+            {
+                cached_statement.migration_state = MigrationState::Successful(CacheType::Shallow);
+            }
+        } else if cached_statement.migration_state.is_pending()
             || cached_statement.migration_state.is_inlined()
         {
             // We got a statement with a pending migration, we want to check if migration is
@@ -1478,7 +1495,12 @@ where
                 skip_reason.is_none()
             });
 
-        let should_fallback = {
+        // A pending shallow statement has no cache to read until a later execute finds one.
+        let should_fallback = if cached_statement.migration_state.is_pending()
+            && cached_statement.shallow.is_some()
+        {
+            true
+        } else {
             let policy = cached_statement.trx_cache_policy;
             // Per-execute ACL gate: a statement prepared before a revocation sees the new
             // verdict here. Checked ahead of the ALWAYS pin, which it overrides.
@@ -1656,7 +1678,10 @@ where
                     .params
                     .as_ref()
                     .ok_or_else(|| internal_err!("Shallow prepare missing params"))?;
-                let view_request = cached_statement.as_shallow()?;
+                let view_request = cached_statement
+                    .shallow
+                    .as_ref()
+                    .ok_or_else(|| internal_err!("Shallow prepare missing query"))?;
 
                 Self::execute_shallow(
                     Self::upstream_mut(upstream)?,
@@ -1672,6 +1697,7 @@ where
                     self.state.shallow_refresh_pool.as_ref(),
                     view_request,
                     results_encoding,
+                    &mut cached_statement.migration_state,
                 )
                 .await
             }
