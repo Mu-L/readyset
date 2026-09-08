@@ -12,7 +12,8 @@ insert into j values
   (4, '{"other": 1}'),
   (5, '{"flag": "hello"}'),
   (6, '{"flag": 42}'),
-  (7, '{"flag": {"nested":1}}');
+  (7, '{"flag": {"nested":1}}'),
+  (8, NULL);
 
 # A JSON string extracts without its quotes.
 query T
@@ -44,12 +45,32 @@ select props ->> 'flag' from j where id in (1, 2);
 false
 true
 
-# JSON null extracts as SQL NULL, as does a missing key.
+# JSON null extracts as SQL NULL, as does a missing key and a NULL column.
 query I rowsort
 select id from j where props ->> 'flag' is null;
 ----
 3
 4
+8
+
+# A NULL column yields NULL under every extraction operator instead of failing the row.
+query TTTT
+select props -> 'flag', props ->> 'flag', props #> '{flag}', props #>> '{flag}' from j where id = 8;
+----
+NULL
+NULL
+NULL
+NULL
+
+# The cast-and-compare shape keeps the NULL row. Rows whose flag is not boolean text are left out
+# since the cast would fail on them upstream.
+query I rowsort
+select id from j where id in (1, 2, 3, 4, 8) and (props ->> 'flag')::boolean is not true;
+----
+2
+3
+4
+8
 
 # `->` keeps the JSON rendering, including the quotes and the JSON null.
 query T
@@ -77,14 +98,21 @@ statement ok
 create table jb (id int, props jsonb);
 
 statement ok
-insert into jb values (1, '{"flag": "hello"}'), (2, '{"flag": null}');
+insert into jb values (1, '{"flag": "hello"}'), (2, '{"flag": null}'), (3, NULL);
 
 query T
 select props ->> 'flag' from jb where id = 1;
 ----
 hello
 
-query I
+query I rowsort
 select id from jb where props ->> 'flag' is null;
 ----
 2
+3
+
+query TT
+select props ? 'flag', props @> '{}' from jb where id = 3;
+----
+NULL
+NULL

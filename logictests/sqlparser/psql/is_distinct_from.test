@@ -84,7 +84,8 @@ insert into jf values
   (1, '{"flag": true}'),
   (2, '{"flag": false}'),
   (3, '{"flag": null}'),
-  (4, '{"other": 1}');
+  (4, '{"other": 1}'),
+  (5, NULL);
 
 query I rowsort
 select id from jf where (props ->> 'flag')::boolean is distinct from true;
@@ -92,6 +93,7 @@ select id from jf where (props ->> 'flag')::boolean is distinct from true;
 2
 3
 4
+5
 
 query I rowsort
 select id from jf where (props ->> 'flag')::boolean is not distinct from true;
@@ -107,7 +109,8 @@ insert into jf2 values
   (1, '{"a": false, "b": false}'),
   (2, '{"a": true,  "b": false}'),
   (3, '{"a": false, "b": true}'),
-  (4, '{}');
+  (4, '{}'),
+  (5, NULL);
 
 query I rowsort
 select id from jf2
@@ -116,6 +119,7 @@ where ((props ->> 'a')::boolean is distinct from true)
 ----
 1
 4
+5
 
 # And unbracketed, as the motivating query actually spells it.
 query I rowsort
@@ -125,3 +129,4 @@ where (props ->> 'a')::boolean is distinct from true
 ----
 1
 4
+5

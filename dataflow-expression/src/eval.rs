@@ -67,7 +67,25 @@ fn eval_binary_op(op: BinaryOperator, left: &DfValue, right: &DfValue) -> ReadyS
             "AT TIME ZONE has not been lowered to expression"
         )),
 
-        // JSON operators:
+        // JSON operators are strict: a NULL operand yields NULL, as in PostgreSQL.
+        JsonExists
+        | JsonAnyExists
+        | JsonAllExists
+        | JsonConcat
+        | JsonPathExtract
+        | JsonPathExtractUnquote
+        | JsonKeyExtract
+        | JsonKeyExtractText
+        | JsonKeyPathExtract
+        | JsonKeyPathExtractText
+        | JsonContains
+        | JsonContainedIn
+        | JsonSubtract
+        | JsonSubtractPath
+            if left.is_none() || right.is_none() =>
+        {
+            Ok(DfValue::None)
+        }
         JsonExists => {
             let json_value = left.to_json()?;
             let key = <&str>::try_from(right)?;
@@ -881,8 +899,12 @@ mod tests {
         expr.eval(&[DfValue::from("bad_json"), DfValue::from("42")])
             .unwrap_err();
 
-        expr.eval(&[DfValue::None, DfValue::from("\"valid_json\"")])
-            .unwrap_err();
+        // A NULL operand yields NULL rather than an error.
+        assert_eq!(
+            expr.eval(&[DfValue::None, DfValue::from("\"valid_json\"")])
+                .unwrap(),
+            DfValue::None
+        );
     }
 
     #[test]
@@ -1488,6 +1510,48 @@ mod tests {
         test(r#"{"is_break": false}"#, true);
         test(r#"{"is_break": true}"#, false);
         test(r#"{"other": 1}"#, true);
+
+        // A NULL column extracts as NULL, and NULL IS DISTINCT FROM true.
+        let expr = "(NULL::json ->> 'is_break')::boolean IS DISTINCT FROM true";
+        assert_eq!(
+            expr_unwrap(
+                try_eval_expr_with_preset(expr, PostgreSQL, ParsingPreset::OnlySqlparser),
+                expr
+            ),
+            true.into(),
+            "incorrect result for `{expr}`"
+        );
+    }
+
+    /// Every JSON operator is strict: a NULL on either side yields NULL rather than an error.
+    #[test]
+    fn eval_json_operators_with_null_operand() {
+        for expr in [
+            "NULL::json -> 'k'",
+            "NULL::json ->> 'k'",
+            "NULL::json -> 0",
+            "NULL::json #> '{k}'",
+            "NULL::json #>> '{k}'",
+            "NULL::jsonb ? 'k'",
+            "NULL::jsonb ?| '{k}'",
+            "NULL::jsonb ?& '{k}'",
+            "NULL::jsonb @> '{}'",
+            "NULL::jsonb <@ '{}'",
+            "NULL::jsonb || '{}'",
+            "NULL::jsonb - 'k'",
+            "NULL::jsonb #- '{k}'",
+            r#"'{"k": 1}'::json -> NULL::text"#,
+            r#"'{"k": 1}'::json ->> NULL::text"#,
+            r#"'{"k": 1}'::jsonb ? NULL::text"#,
+            r#"'{"k": 1}'::jsonb @> NULL::jsonb"#,
+            r#"'{"k": 1}'::jsonb - NULL::text"#,
+        ] {
+            assert_eq!(
+                eval_expr(expr, PostgreSQL),
+                DfValue::None,
+                "incorrect result for `{expr}`"
+            );
+        }
     }
 
     /// Tests evaluation of `JsonKeyExtract` and `JsonKeyExtractText` binary ops.
